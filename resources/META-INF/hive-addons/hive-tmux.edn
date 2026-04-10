@@ -1,0 +1,6 @@
+{:addon/id           "hive.tmux"
+ :addon/type         :native
+ :addon/init-ns      "hive-tmux.init"
+ :addon/init-fn      "init-as-addon!"
+ :addon/capabilities #{:terminal :health-reporting}
+ :addon/description  "tmux terminal backend via libtmux Python interop"}
