@@ -5,7 +5,7 @@
 
         ;; hive-dsl — Result monad, rescue/guard DSL, ADTs
         io.github.hive-agi/hive-dsl
-        {:git/tag "v0.3.9" :git/sha "494af2c0ef889380649e1578942ffdfc205f446d"}
+        {:git/tag "v0.4.0" :git/sha "c561cb7d111b86b2e2c5a8446465dc5e3ab95778"}
 
         ;; hive-events — event system for pane lifecycle
         io.github.hive-agi/hive-events
@@ -15,4 +15,4 @@
          :extra-deps {lambdaisland/kaocha {:mvn/version "1.91.1392"}
                       org.clojure/test.check {:mvn/version "1.1.1"}
                       io.github.hive-agi/hive-test
-                      {:git/tag "v0.1.6" :git/sha "a53e9f8"}}}}}
+                      {:git/tag "v0.2.0" :git/sha "841da83"}}}}}
