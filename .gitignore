@@ -4,3 +4,5 @@ target/
 *.pyc
 __pycache__/
 .nrepl-port
+.clj-kondo/
+.lsp/
