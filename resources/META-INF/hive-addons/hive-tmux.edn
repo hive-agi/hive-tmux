@@ -1,4 +1,5 @@
 {:addon/id           "hive.tmux"
+ :addon/kind         :library
  :addon/type         :native
  :addon/init-ns      "hive-tmux.init"
  :addon/init-fn      "init-as-addon!"

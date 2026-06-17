@@ -11,6 +11,7 @@
   (:require [clojure.java.shell :as shell]
             [hive-dsl.adt :refer [defadt adt-case]]
             [hive-dsl.result :refer [rescue guard try-effect*]]
+            [hive-tmux.config :as config]
             [taoensso.timbre :as log]))
 
 ;; Copyright (C) 2026 Pedro Gomes Branquinho (BuddhiLW) <pedrogbranquinho@gmail.com>
@@ -24,12 +25,33 @@
 (defonce ^:private python-initialized? (atom false))
 (defonce ^:private cached-status (atom nil))
 
-(def ^:private default-python-executable
-  "Default Python executable path. Prefers conda 'hive' env if it exists."
-  (let [conda-python "/home/lages/anaconda3/envs/hive/bin/python"]
-    (if (.exists (java.io.File. conda-python))
-      conda-python
-      nil)))
+(defn- conda-candidates
+  "HOME-relative conda Python paths to probe. Order = priority."
+  []
+  (let [home (or (System/getenv "HOME") (System/getProperty "user.home"))]
+    (when home
+      [(str home "/anaconda3/envs/hive/bin/python")
+       (str home "/miniconda3/envs/hive/bin/python")
+       (str home "/anaconda3/bin/python")
+       (str home "/miniconda3/bin/python")])))
+
+(defn- detect-conda-python
+  "Return first existing conda Python from `conda-candidates`, or nil."
+  []
+  (some (fn [path]
+          (when (.exists (java.io.File. ^String path)) path))
+        (conda-candidates)))
+
+(defn default-python-executable
+  "Resolve the Python interpreter for libpython-clj.
+
+   Precedence:
+     1. hive-di `PythonConfig/:python-executable` (env-driven)
+     2. HOME-relative conda env auto-detection
+     3. nil — caller lets libpython-clj autodetect."
+  []
+  (or (-> (config/resolve-PythonConfig) :ok :python-executable)
+      (detect-conda-python)))
 
 ;;; =============================================================================
 ;;; Preflight Status ADT (CLARITY-Y: Yield Safe Failure)
@@ -154,7 +176,7 @@
                (preflight-status :preflight/no-libpython)
 
                ;; 2. Python executable exists?
-               (let [py-exe (or (:python-executable opts) default-python-executable)]
+               (let [py-exe (or (:python-executable opts) (default-python-executable))]
                  (and (nil? py-exe)
                       (not (.exists (java.io.File. "/usr/bin/python3")))))
                (preflight-status :preflight/no-python-exe)
@@ -163,7 +185,7 @@
                (let [init-result
                      (try-effect* :preflight/python-init-fail
                                   (let [init! (requiring-resolve 'libpython-clj2.python/initialize!)
-                                        py-exe (or (:python-executable opts) default-python-executable)]
+                                        py-exe (or (:python-executable opts) (default-python-executable))]
                                     (if py-exe
                                       (init! :python-executable py-exe)
                                       (init!))))]
@@ -208,7 +230,7 @@
          (reset! python-initialized? true)
          (log/info "[tmux-bridge] Python initialized, libtmux available"
                    {:executable (or (:python-executable opts)
-                                    default-python-executable
+                                    (default-python-executable)
                                     "system default")})
          true)
        false))))
