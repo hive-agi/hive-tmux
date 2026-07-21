@@ -2,6 +2,6 @@
  :addon/kind         :library
  :addon/type         :native
  :addon/init-ns      "hive-tmux.init"
- :addon/init-fn      "init-as-addon!"
+ :addon/init-fn      "addon-ctor"
  :addon/capabilities #{:terminal :health-reporting}
  :addon/description  "tmux terminal backend via libtmux Python interop"}

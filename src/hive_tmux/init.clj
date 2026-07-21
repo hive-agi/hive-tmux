@@ -203,6 +203,17 @@
 ;; Public API
 ;; =============================================================================
 
+(defn addon-ctor
+  "Pure constructor for the `hive.tmux` IAddon — (config -> IAddon | nil).
+   The mounter (hive-addon.mount) resolves this via :addon/init-fn; the host
+   then drives register!/initialize!. Returns nil when the IAddon protocol is
+   absent from the classpath (graceful, standalone mode). No registration, no
+   init!, no side effects — construction only (preflight/registration effects
+   run inside the record's initialize!). Additive: the self-registering
+   `init-as-addon!` path remains for the current hive-mcp loader."
+  [_config]
+  (make-addon))
+
 (defn init-as-addon!
   "Register hive-tmux as an IAddon. Returns registration result."
   []
