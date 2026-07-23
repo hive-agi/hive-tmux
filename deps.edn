@@ -5,15 +5,15 @@
 
         ;; hive-dsl — Result monad, rescue/guard DSL, ADTs
         io.github.hive-agi/hive-dsl
-        {:mvn/version "0.5.2"}
+        {:mvn/version "0.5.5"}
 
         ;; hive-di — typed config DI (env/file/coalesce sources)
         io.github.hive-agi/hive-di
-        {:mvn/version "0.3.1"}
+        {:mvn/version "0.3.2"}
 
         ;; hive-events — event system for pane lifecycle
         io.github.hive-agi/hive-events
-        {:mvn/version "0.5.2"}}
+        {:mvn/version "0.5.4"}}
  :aliases
  {
   ;; :build — tools.build entrypoint (clojure -T:build <task>). Canonical hive
@@ -25,4 +25,4 @@
          :extra-deps {lambdaisland/kaocha {:mvn/version "1.91.1392"}
                       org.clojure/test.check {:mvn/version "1.1.1"}
                       io.github.hive-agi/hive-test
-                      {:mvn/version "0.3.6"}}}}}
+                      {:mvn/version "0.3.8"}}}}}
