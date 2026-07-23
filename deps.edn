@@ -5,7 +5,7 @@
 
         ;; hive-dsl — Result monad, rescue/guard DSL, ADTs
         io.github.hive-agi/hive-dsl
-        {:mvn/version "0.5.7"}
+        {:mvn/version "0.5.8"}
 
         ;; hive-di — typed config DI (env/file/coalesce sources)
         io.github.hive-agi/hive-di
