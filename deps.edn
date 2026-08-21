@@ -5,23 +5,23 @@
 
         ;; hive-dsl — Result monad, rescue/guard DSL, ADTs
         io.github.hive-agi/hive-dsl
-        {:mvn/version "0.5.15"}
+        {:mvn/version "0.5.16"}
 
         ;; hive-di — typed config DI (env/file/coalesce sources)
         io.github.hive-agi/hive-di
-        {:mvn/version "0.4.3"}
+        {:mvn/version "0.4.4"}
 
         ;; hive-events — event system for pane lifecycle
         io.github.hive-agi/hive-events
-        {:mvn/version "0.5.6"}}
+        {:mvn/version "0.5.7"}}
  :aliases
  {
   ;; :build — tools.build entrypoint (clojure -T:build <task>). Canonical hive
   ;; build: jar / jar-aot / install / bump / verify-license / deploy.
-  :build {:deps {io.github.hive-agi/hive-build {:mvn/version "0.1.9"}}
+  :build {:deps {io.github.hive-agi/hive-build {:mvn/version "0.1.10"}}
           :ns-default hive-build.api}
 :test {:extra-paths ["test"]
          :extra-deps {lambdaisland/kaocha {:mvn/version "1.91.1392"}
                       org.clojure/test.check {:mvn/version "1.1.3"}
                       io.github.hive-agi/hive-test
-                      {:mvn/version "0.3.12"}}}}}
+                      {:mvn/version "0.3.14"}}}}}
