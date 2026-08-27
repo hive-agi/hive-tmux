@@ -2,4 +2,4 @@
  :parent "hive"
  :description "tmux terminal backend addon for hive-mcp — libtmux-based ling lifecycle via libpython-clj"
  :language :clojure
- :tags ["tmux" "terminal" "addon" "python" "libtmux"]}
+ :tags ["tmux" "terminal" "addon" "python" "libtmux"] :carto {:source-roots ["resources" "src" "test"]}}
