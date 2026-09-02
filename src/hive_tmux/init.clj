@@ -7,7 +7,8 @@
    Usage:
      ;; Via addon system (auto-discovered from META-INF manifest):
      (init-as-addon!)"
-  (:require [hive-tmux.terminal :as terminal]
+  (:require [hive-addon.protocol :as addon]
+            [hive-tmux.terminal :as terminal]
             [hive-tmux.python.bridge :as py-bridge]
             [hive-tmux.state :as tmux-state]
             [hive-tmux.swarm-bridge :as swarm-bridge]
@@ -36,13 +37,11 @@
 (defonce ^:private addon-instance (atom nil))
 
 (defn- make-addon
-  "Create an IAddon reify for hive-tmux.
-   Returns nil if protocol is not on classpath."
+  "Create an IAddon reify for hive-tmux."
   []
-  (when (try-resolve 'hive-mcp.addons.protocol/IAddon)
-    (let [state (atom {:initialized? false})]
-      (reify
-        hive-mcp.addons.protocol/IAddon
+  (let [state (atom {:initialized? false})]
+    (reify
+      addon/IAddon
 
         (addon-id [_] "hive.tmux")
 
@@ -149,7 +148,7 @@
                :details {:reason "not initialized"
                          :preflight (:adt/variant preflight)
                          :hint (when (not= :preflight/available (:adt/variant preflight))
-                                 (py-bridge/remediation-hint preflight))}})))))))
+                                 (py-bridge/remediation-hint preflight))}}))))))
 
 ;; =============================================================================
 ;; Dep Registry + Nil-Railway Pipeline

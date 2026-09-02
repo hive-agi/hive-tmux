@@ -5,7 +5,8 @@
    Follows EmacsVessel pattern — slave lookup via ISwarmRegistry/get-slave protocol.
 
    Capabilities: #{:terminal} (no editor, delivery, or repl)."
-  (:require [hive-dsl.result :refer [guard rescue]]
+  (:require [hive-addon.vessel :as vessel]
+            [hive-dsl.result :refer [guard rescue]]
             [taoensso.timbre :as log]))
 
 ;; Copyright (C) 2026 Pedro Gomes Branquinho (BuddhiLW) <pedrogbranquinho@gmail.com>
@@ -48,40 +49,38 @@
 ;;; ============================================================================
 
 (defn create-tmux-vessel
-  "Create a TmuxVessel implementing IVessel.
-   Returns nil if IVessel protocol is not on classpath."
+  "Create a TmuxVessel implementing IVessel."
   []
-  (when-let [_proto (try-resolve 'hive-mcp.protocols.vessel/IVessel)]
-    (reify
-      hive-mcp.protocols.vessel/IVessel
+  (reify
+    vessel/IVessel
 
-      (vessel-id [_] :tmux)
+    (vessel-id [_] :tmux)
 
-      (capabilities [_] #{:terminal})
+    (capabilities [_] #{:terminal})
 
-      (resolve-context [_ agent-id]
-        (when agent-id
-          (rescue nil
-                  (when-let [slave (get-slave-via-protocol agent-id)]
-                    (let [cwd (:slave/cwd slave)
-                          project-id (or (:slave/project-id slave)
-                                         (derive-project-id cwd))]
-                      (when (or cwd project-id)
-                        {:cwd cwd
-                         :project-id project-id}))))))
+    (resolve-context [_ agent-id]
+      (when agent-id
+        (rescue nil
+                (when-let [slave (get-slave-via-protocol agent-id)]
+                  (let [cwd (:slave/cwd slave)
+                        project-id (or (:slave/project-id slave)
+                                       (derive-project-id cwd))]
+                    (when (or cwd project-id)
+                      {:cwd cwd
+                       :project-id project-id}))))))
 
-      (addon [_ capability]
-        (case capability
-          :terminal (resolve-terminal-addon)
-          nil))
+    (addon [_ capability]
+      (case capability
+        :terminal (resolve-terminal-addon)
+        nil))
 
-      (initialize! [_ config]
-        (log/info "TmuxVessel initialized" (when config {:config-keys (keys config)}))
-        nil)
+    (initialize! [_ config]
+      (log/info "TmuxVessel initialized" (when config {:config-keys (keys config)}))
+      nil)
 
-      (shutdown! [_]
-        (log/info "TmuxVessel shut down")
-        nil))))
+    (shutdown! [_]
+      (log/info "TmuxVessel shut down")
+      nil)))
 
 ;;; ============================================================================
 ;;; Registration Helpers

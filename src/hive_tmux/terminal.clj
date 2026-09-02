@@ -6,7 +6,8 @@
    (zero compile-time coupling).
 
    Uses hive-dsl rescue/guard instead of raw try-catch."
-  (:require [hive-tmux.python.tmux-ops :as tmux-ops]
+  (:require [hive-addon.terminal :as addon-term]
+            [hive-tmux.python.tmux-ops :as tmux-ops]
             [hive-tmux.state :as state]
             [hive-tmux.events :as tmux-ev]
             [hive.events :as ev]
@@ -64,13 +65,11 @@
 ;; =============================================================================
 
 (defn make-tmux-terminal
-  "Create an ITerminalAddon reify for tmux backend.
-   Returns nil if ITerminalAddon protocol is not on classpath."
+  "Create an ITerminalAddon reify for tmux backend."
   []
-  (when (try-resolve 'hive-mcp.addons.terminal/ITerminalAddon)
-    (tmux-ev/ensure-init!)
-    (reify
-      hive-mcp.addons.terminal/ITerminalAddon
+  (tmux-ev/ensure-init!)
+  (reify
+    addon-term/ITerminalAddon
 
       (terminal-id [_] :tmux)
 
@@ -148,4 +147,4 @@
               (guard Exception nil
                      (ev/dispatch [:tmux/interrupt-sent {:ling-id id}]))
               {:success? true
-               :ling-id id})))))))
+               :ling-id id}))))))
