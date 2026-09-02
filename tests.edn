@@ -1,0 +1,14 @@
+#kaocha/v1
+{:tests
+ [{:id :unit
+   ;; The ^:integration tests drive a REAL tmux server through libtmux, so they
+   ;; need a session and the conda hive env. Without those they take the
+   ;; (when (ensure-python!) ...) branch and assert nothing, which kaocha
+   ;; correctly reports as a FAILURE rather than a pass: a test that ran no
+   ;; assertions proved nothing.
+   ;;
+   ;; Skipping by metadata is the honest form. kaocha reports them as skipped,
+   ;; so the count says what was not run instead of hiding it inside a green
+   ;; total. Run them deliberately:
+   ;;   clojure -M:test --focus-meta :integration
+   :kaocha.filter/skip-meta [:integration]}]}

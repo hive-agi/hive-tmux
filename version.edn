@@ -1,6 +1,6 @@
 {:lib      io.github.hive-agi/hive-tmux
  :minor    1
- :license  {:name "UNDECLARED" :url ""}
+ :license  {:name "MIT" :url "https://opensource.org/licenses/MIT"}
  :scm-url  "https://github.com/hive-agi/hive-tmux"
  :src-dirs ["src" "resources"]
- :publish  :none}
+ :publish  :clojars}

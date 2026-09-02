@@ -1,0 +1,74 @@
+name: release
+
+# Patch-bump and publish only when the push actually changes the library.
+# README / CI / test-only commits do not mint a version, because a published
+# pom is immutable on both Clojars and the private registry.
+#
+# version.edn is a trigger path here: it carries :src-dirs, so a change to it
+# changes what the jar CONTAINS. Leaving it out means a packaging fix lands on
+# main looking done while every consumer keeps getting the old jar.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'resources/**'
+      - 'deps.edn'
+      - 'version.edn'
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: DeLaGuardo/setup-clojure@13.0
+        with:
+          cli: latest
+
+      # A published pom is immutable, so the suite runs BEFORE anything is
+      # minted. Without this step a red push straight to main would still
+      # deploy, under a version number that can never be replaced.
+      #
+      # The ^:integration tests drive a real tmux server through libtmux and
+      # are skipped by tests.edn, so this runs the unit suite. A runner has
+      # neither a tmux session nor the conda env.
+      - name: Run tests
+        run: clojure -M:test
+
+      # Every dependency must resolve from public registries BEFORE the tag is
+      # pushed. A resolution failure after the tag leaves a version that has no
+      # artifact behind it, permanently, because the next run bumps past it.
+      - name: Resolve dependencies
+        run: clojure -Sforce -P
+
+      - name: Bump patch version
+        run: clojure -T:build bump :level :patch
+
+      - name: Commit and tag
+        run: |
+          VER=$(cat VERSION)
+          git config user.name  "hive-ci"
+          git config user.email "ci@hive-agi.local"
+          git add VERSION
+          # [skip ci] stops this push from retriggering the workflow.
+          git commit -m "chore(release): $VER [skip ci]"
+          # Annotated: `git push --follow-tags` ignores lightweight tags,
+          # which would publish the artifact and silently drop the tag.
+          git tag -a "v$VER" -m "release $VER"
+          git push --follow-tags
+
+      - name: Deploy
+        env:
+          CLOJARS_USERNAME: ${{ secrets.CLOJARS_USERNAME }}
+          CLOJARS_PASSWORD: ${{ secrets.CLOJARS_DEPLOY_TOKEN }}
+        run: clojure -T:build deploy
