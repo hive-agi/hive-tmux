@@ -4,4 +4,6 @@
  :addon/init-ns      "hive-tmux.init"
  :addon/init-fn      "addon-ctor"
  :addon/capabilities #{:terminal :health-reporting}
- :addon/description  "tmux terminal backend via libtmux Python interop"}
+ :addon/description  "tmux terminal backend via libtmux Python interop"
+ :addon/maturity :stable
+ :addon/trust-class :foss}
