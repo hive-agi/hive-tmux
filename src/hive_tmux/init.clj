@@ -14,7 +14,8 @@
             [hive-tmux.swarm-bridge :as swarm-bridge]
             [hive-tmux.vessel :as vessel]
             [hive-dsl.result :refer [guard rescue]]
-            [taoensso.timbre :as log]))
+            [taoensso.timbre :as log]
+            [hive-tmux.vessel-target :as vtarget]))
 
 ;; Copyright (C) 2026 Pedro Gomes Branquinho (BuddhiLW) <pedrogbranquinho@gmail.com>
 ;;
@@ -47,9 +48,9 @@
 
         (addon-type [_] :native)
 
-        (capabilities [_] #{:terminal :health-reporting})
+        (capabilities [_] #{:terminal :health-reporting :vessel})
 
-        (initialize! [_ _config]
+        (initialize! [_ config]
           (if (:initialized? @state)
             {:success? true :already-initialized? true}
             ;; Step 1: Preflight — Python, libtmux, tmux binary
@@ -101,7 +102,10 @@
                                   ;; lifecycle events reach hive-mcp.channel.core +
                                   ;; NATS backbone (and thus swarm/sync handlers).
                                   (guard Exception nil (swarm-bridge/start!))
+                                  ;; The config is kept for the hive-vessel target
+                                  ;; (hooks), which reads it per call.
                                   (reset! state {:initialized? true
+                                                 :config (or config {})
                                                  :terminal-addon tmux-addon})
                                   (log/info "hive-tmux addon initialized — :tmux terminal + spawn-mode registered")
                                   {:success? true
@@ -137,6 +141,11 @@
         (tools [_] [])
 
         (schema-extensions [_] {})
+
+        ;; The hive-vessel target: :text natives through the tmux CLI on the
+        ;; session the python bridge drives. Contributed only while active and
+        ;; resolved per call, so it is nil once shut down.
+        (hooks [_] (vtarget/hooks-for state))
 
         (health [_]
           (if (:initialized? @state)

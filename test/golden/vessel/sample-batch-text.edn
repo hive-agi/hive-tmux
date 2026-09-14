@@ -1,0 +1,54 @@
+[#:text{:panel "olympus/tab-2",
+        :lines
+        ["Carto \"Flow\" \\ #3"
+         ""
+         "apply write-form"
+         ""
+         "succeeded"
+         ""
+         "paths  : src/a.clj"
+         "         src/b.clj"
+         "verify : ok"
+         ""
+         "  - one"
+         "  - two"
+         "    more"
+         ""
+         "    (defn f [] \"x\")"
+         ""
+         "@@ -1,2 +1,2 @@"
+         "-(old)"
+         "+(new ü)"
+         " context"
+         ""
+         "open a"],
+        :face-lines
+        [{:text "Carto \"Flow\" \\ #3", :face :title}
+         {:text "", :face :plain}
+         {:text "apply write-form", :face :heading}
+         {:text "", :face :plain}
+         {:text "succeeded", :face :success}
+         {:text "", :face :plain}
+         {:text "paths  : src/a.clj", :face :plain}
+         {:text "         src/b.clj", :face :plain}
+         {:text "verify : ok", :face :plain}
+         {:text "", :face :plain}
+         {:text "  - one", :face :plain}
+         {:text "  - two", :face :plain}
+         {:text "    more", :face :plain}
+         {:text "", :face :plain}
+         {:text "    (defn f [] \"x\")", :face :code}
+         {:text "", :face :plain}
+         {:text "@@ -1,2 +1,2 @@", :face :hunk}
+         {:text "-(old)", :face :removed}
+         {:text "+(new ü)", :face :added}
+         {:text " context", :face :plain}
+         {:text "", :face :plain}
+         {:text "open a", :face :link, :file "/tmp/a.clj", :line 2}]}
+ #:text{:lines ["[info] frame 7 applied"]}
+ #:text{:lines ["[error] boom" "[error] second line"]}
+ #:text{:lines ["open /tmp/a b.clj:3:7"],
+        :open {:file "/tmp/a b.clj", :line 3, :column 7}}
+ #:text{:lines ["open /tmp/a.clj"], :open {:file "/tmp/a.clj"}}
+ #:text{:terminal "*vterm*", :lines ["ls -la"], :keys "ls -la\n"}
+ #:text{:panel "olympus/tab-2", :close? true, :lines []}]
