@@ -15,7 +15,8 @@
             [hive-tmux.vessel :as vessel]
             [hive-dsl.result :refer [guard rescue]]
             [taoensso.timbre :as log]
-            [hive-tmux.vessel-target :as vtarget]))
+            [hive-tmux.vessel-target :as vtarget]
+            [hive-tmux.observe.lifecycle :as observe]))
 
 ;; Copyright (C) 2026 Pedro Gomes Branquinho (BuddhiLW) <pedrogbranquinho@gmail.com>
 ;;
@@ -106,7 +107,11 @@
                                   ;; (hooks), which reads it per call.
                                   (reset! state {:initialized? true
                                                  :config (or config {})
-                                                 :terminal-addon tmux-addon})
+                                                 :terminal-addon tmux-addon
+                                                 ;; Step 8: tmux-originated event
+                                                 ;; ingestion. Inert unless the
+                                                 ;; operator opts into hooks.
+                                                 :observe (observe/start! (or config {}))})
                                   (log/info "hive-tmux addon initialized — :tmux terminal + spawn-mode registered")
                                   {:success? true
                                    :errors []
@@ -123,7 +128,10 @@
         (shutdown! [_]
           (when (:initialized? @state)
             ;; Uninstall swarm event bridge (restores log-only handlers)
-            (guard Exception nil (swarm-bridge/stop!))
+            (do
+              ;; Stop tmux-originated ingestion, removing only hooks we installed.
+              (guard Exception nil (observe/stop! (:observe @state)))
+              (guard Exception nil (swarm-bridge/stop!)))
             ;; Deregister terminal backend
             (when-let [dereg-fn (try-resolve 'hive-mcp.agent.ling.terminal-registry/deregister-terminal!)]
               (dereg-fn :tmux))
