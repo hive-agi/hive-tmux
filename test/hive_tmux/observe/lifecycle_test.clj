@@ -64,3 +64,17 @@
     (testing "and one unset per hook on the way out"
       (is (= 2 (count @ran)))
       (is (every? #(= ["set-hook" "-gu"] (subvec % 0 2)) @ran)))))
+
+(deftest client-cmd-resolves-to-something-tmux-can-run
+  (testing "a resolved binary is absolute: tmux runs hooks from a cwd we do not own"
+    (let [cmd (lc/default-client-cmd)]
+      (is (vector? cmd))
+      (is (seq cmd))
+      (is (every? string? cmd))
+      (if (= 1 (count cmd))
+        (let [bin (first cmd)]
+          (is (.isAbsolute (java.io.File. ^String bin))
+              "a relative binary path would resolve against tmux's cwd")
+          (is (.canExecute (java.io.File. ^String bin))))
+        (is (= ["cljw" "-cp" "src:native" "-m" "hive-tmux.observe.hook-client"] cmd)
+            "the only non-binary fallback is running the source through cljw")))))

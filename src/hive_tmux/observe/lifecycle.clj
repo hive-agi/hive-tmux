@@ -12,8 +12,26 @@
             [hive-tmux.observe.listener :as listener]
             [taoensso.timbre :as log]))
 
-(def ^:private default-client-cmd
-  ["cljw" "-cp" "src" "-M" "native/hive_tmux_hook.cljc"])
+(defn default-client-cmd
+  "The command tmux runs per hook firing.
+
+   Prefers the compiled client named by `$HIVE_TMUX_HOOK_BIN`, else the one
+   installed at `~/.local/bin/hive-tmux-hook`, and falls back to running the
+   source through cljw.
+
+   Compiling buys no speed (both start in ~17ms), so the reason to prefer the
+   binary is that it is self-contained: tmux runs a hook with a cwd the addon
+   does not own, and the interpreted form needs a relative classpath, the
+   source tree, and prints a deps.edn note on every firing."
+  []
+  (let [candidates (remove nil?
+                           [(System/getenv "HIVE_TMUX_HOOK_BIN")
+                            (str (System/getProperty "user.home")
+                                 "/.local/bin/hive-tmux-hook")])]
+    (or (some (fn [p]
+                (when (.canExecute (java.io.File. ^String p)) [p]))
+              candidates)
+        ["cljw" "-cp" "src:native" "-m" "hive-tmux.observe.hook-client"])))
 
 (defn default-socket-path
   "Where the listener binds when the operator names no path.
@@ -28,7 +46,7 @@
   "The ingestion config carried by addon CONFIG, with defaults applied."
   [config]
   {:socket-path (or (:tmux/observe-socket config) (default-socket-path))
-   :client-cmd  (or (:tmux/observe-client-cmd config) default-client-cmd)
+   :client-cmd  (or (:tmux/observe-client-cmd config) (default-client-cmd))
    :hooks       (vec (or (:tmux/observe-hooks config) plan/default-hooks))})
 
 (defn enabled?
