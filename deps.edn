@@ -1,5 +1,5 @@
 {:paths ["src" "resources"]
- :deps {org.clojure/clojure {:mvn/version "1.12.5"}
+ :deps {org.clojure/clojure {:mvn/version "1.12.6"}
         com.taoensso/timbre {:mvn/version "6.8.0"}
         clj-python/libpython-clj {:mvn/version "2.026"}
 
@@ -10,31 +10,31 @@
         ;; addon reifies, hive-addon.terminal/ITerminalAddon and
         ;; hive-addon.vessel/IVessel.
         io.github.hive-agi/hive-addon
-        {:mvn/version "1.0.4"}
+        {:mvn/version "1.0.10"}
 
         ;; hive-dsl — Result monad, rescue/guard DSL, ADTs
         io.github.hive-agi/hive-dsl
-        {:mvn/version "0.5.24"}
+        {:mvn/version "0.5.27"}
 
         ;; hive-di — typed config DI (env/file/coalesce sources)
         io.github.hive-agi/hive-di
-        {:mvn/version "0.4.11"}
+        {:mvn/version "0.4.12"}
 
         ;; hive-events — event system for pane lifecycle
         io.github.hive-agi/hive-events
-        {:mvn/version "0.5.13"}
-        io.github.hive-agi/hive-vessel {:mvn/version "0.1.3"}}
+        {:mvn/version "0.5.14"}
+        io.github.hive-agi/hive-vessel {:mvn/version "0.1.4"}}
  :aliases
  {
   ;; :build — tools.build entrypoint (clojure -T:build <task>). Canonical hive
   ;; build: jar / jar-aot / install / bump / verify-license / deploy.
-  :build {:deps {io.github.hive-agi/hive-build {:mvn/version "0.1.15"}}
+  :build {:deps {io.github.hive-agi/hive-build {:mvn/version "0.1.17"}}
           :ns-default hive-build.api}
   :test {:extra-paths ["test"]
          :extra-deps {lambdaisland/kaocha {:mvn/version "1.91.1392"}
                                            org.clojure/test.check {:mvn/version "1.1.3"}
                                            io.github.hive-agi/hive-test {:mvn/version "0.4.5"}
-                                           io.github.hive-agi/hive-schemas {:mvn/version "0.1.33"}}
+                                           io.github.hive-agi/hive-schemas {:mvn/version "0.1.34"}}
          ;; Without :main-opts, `clojure -M:test` starts a REPL and runs no
          ;; tests, so a release gate invoking it would pass on every input.
          :main-opts ["-m" "kaocha.runner"]}}}
