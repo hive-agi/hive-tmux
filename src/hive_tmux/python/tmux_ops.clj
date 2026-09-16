@@ -127,17 +127,57 @@
      :window    window}))
 
 (defn send-keys!
-  "Send keys to a tmux pane.
-
-   Arguments:
-     pane - libtmux pane object
-     text - string to send
-     opts - {:enter? bool} (default true — press Enter after text)"
+  "Send text literally; libtmux submits Enter separately.
+   opts: :enter? and :literal? both default true.
+   The final arity accepts transport operations for isolated adapters/tests."
   ([pane text] (send-keys! pane text {}))
-  ([pane text {:keys [enter?] :or {enter? true}}]
-   (py/py-call pane "send_keys" text :enter enter?)
-   (log/debug "[tmux-ops] Sent keys to pane" {:pane-id (str (py/py-attr pane "pane_id"))
-                                              :text-length (count text)})))
+  ([pane text opts] (send-keys! pane text opts {:call py/py-call :attr py/py-attr}))
+  ([pane text {:keys [enter? literal?] :or {enter? true literal? true}}
+    {:keys [call attr]}]
+   (call pane "send_keys" text :enter enter? :literal literal?)
+   (log/debug "[tmux-ops] Sent keys to pane"
+              {:pane-id (str (attr pane "pane_id")) :text-length (count text)})))
+
+(defn send-bracketed-paste!
+  "Paste one literal CLI input frame, preserving LF, then submit one Enter.
+   Requires a bracketed-paste-aware CLI (the self-steer Codex/Claude targets).
+   Uses an owned temporary file/buffer; generic keyboard sending is unchanged."
+  ([pane text] (send-bracketed-paste! pane text {}))
+  ([pane text opts]
+   (send-bracketed-paste! pane text opts {:call py/py-call :attr py/py-attr}))
+  ([pane text {:keys [enter?] :or {enter? true}} {:keys [call attr]}]
+   (when-not (and (string? text)
+                  (not (re-find #"[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]" text)))
+     (throw (ex-info "Paste input contains terminal control characters"
+                     {:type :tmux/invalid-paste})))
+   (let [server (attr pane "server")
+         buffer-name (str "hive-self-steer-" (java.util.UUID/randomUUID))
+         path (java.nio.file.Files/createTempFile
+                "hive-self-steer-paste-" ".txt"
+                (make-array java.nio.file.attribute.FileAttribute 0))
+         invoke! (fn [object & args]
+                   (let [result (apply call object "cmd" args)
+                         exit (attr result "returncode")]
+                     (when-not (= 0 exit)
+                       (throw (ex-info "tmux paste command failed"
+                                       {:type :tmux/paste-failed :command (first args)
+                                        :exit exit})))
+                     result))]
+     (try
+       (java.nio.file.Files/write
+         path (.getBytes (str "\u001b[200~" text "\u001b[201~")
+                         java.nio.charset.StandardCharsets/UTF_8)
+         (make-array java.nio.file.OpenOption 0))
+       (invoke! server "load-buffer" "-b" buffer-name "--" (str path))
+       ;; -r preserves every LF; explicit framing works independently of tmux's
+       ;; snapshot of whether the application requested bracketed paste.
+       (invoke! pane "paste-buffer" "-r" "-d" "-b" buffer-name)
+       (when enter? (invoke! pane "send-keys" "Enter"))
+       nil
+       (finally
+         ;; Only our UUID-named buffer is touched; it may already be consumed.
+         (guard Exception nil (call server "cmd" "delete-buffer" "-b" buffer-name))
+         (java.nio.file.Files/deleteIfExists path))))))
 
 (defn capture-output
   "Capture the current pane content (last N lines).

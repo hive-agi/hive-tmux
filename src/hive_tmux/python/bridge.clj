@@ -105,12 +105,32 @@
            (when-not (guard Exception false (get-attr stderr "encoding") true)
              (set-attr! stderr "encoding" "utf-8")))))
 
+(defn- ensure-site-packages!
+  "Add existing interpreter package paths once, without Python resets or .pth execution."
+  ([] (ensure-site-packages!
+       {:import (requiring-resolve 'libpython-clj2.python/import-module)
+        :attr (requiring-resolve 'libpython-clj2.python/get-attr)
+        :call (requiring-resolve 'libpython-clj2.python/call-attr)
+        :convert (requiring-resolve 'libpython-clj2.python/->jvm)
+        :directory? #(.isDirectory (java.io.File. %))}))
+  ([{:keys [import attr call convert directory?]}]
+   (let [sys (import "sys")
+         sysconfig (import "sysconfig")
+         path (attr sys "path")]
+     (doseq [kind ["purelib" "platlib"]
+             :let [directory (convert (call sysconfig "get_path" kind))]
+             :when (and (string? directory) (directory? directory)
+                        (not (some #{directory} (convert path))))]
+       (call path "append" directory))
+     true)))
+
 (defn- check-libtmux-importable?
   "Check if libtmux Python package is importable.
    Must be called AFTER libpython-clj is initialized and IO patched."
   []
   (boolean
    (guard Exception false
+          (ensure-site-packages!)
           (patch-io-encoding!)
           (let [import-fn (requiring-resolve 'libpython-clj2.python/import-module)]
             (import-fn "libtmux")
@@ -168,7 +188,8 @@
    Use `remediation-hint` for user-facing install instructions."
   ([] (run-preflight {}))
   ([opts]
-   (or @cached-status
+   (or (when (= :preflight/available (:adt/variant @cached-status))
+         @cached-status)
        (let [status
              (cond
                ;; 1. libpython-clj on classpath?
