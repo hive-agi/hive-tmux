@@ -23,7 +23,7 @@
         ;; hive-events — event system for pane lifecycle
         io.github.hive-agi/hive-events
         {:mvn/version "0.5.19"}
-        io.github.hive-agi/hive-vessel {:mvn/version "0.1.17"}}
+        io.github.hive-agi/hive-vessel {:mvn/version "0.1.18"}}
  :aliases
  {
   ;; :build — tools.build entrypoint (clojure -T:build <task>). Canonical hive
