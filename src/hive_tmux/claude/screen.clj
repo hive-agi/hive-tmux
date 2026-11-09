@@ -118,6 +118,19 @@
 (def ^:private unread
   {:claude? false :ctx-tokens nil :busy? nil :goal-active? false :goal-age nil :footer-name nil :vim-mode nil :activity nil :input nil})
 
+(defn- space? [c]
+  (or (Character/isWhitespace ^char c) (Character/isSpaceChar ^char c)))
+
+(defn utrim
+  "S without leading and trailing space of any kind. `str/trim` keeps U+00A0,
+   and Claude Code draws its empty prompt as `❯` + NO-BREAK SPACE, so a plain
+   trim reads every idle prompt as pending input."
+  [s]
+  (let [s (str s)
+        b (count (take-while space? s))
+        e (- (count s) (count (take-while space? (reverse s))))]
+    (if (< b e) (subs s b e) "")))
+
 (defn read-screen
   "The facts of LINES, a pane capture top to bottom. A screen with no prompt
    is `:claude? false` with every fact nil: not a Claude Code pane, or one
@@ -141,7 +154,7 @@
          :footer-name (last-some footer-name-of above)
          :vim-mode (vim-mode (subvec lines p))
          :activity activity
-         :input (not-empty (str/trim (subs prompt-line 1)))})
+         :input (not-empty (utrim (subs prompt-line 1)))})
       unread)))
 
 (m/=> read-screen [:=> [:cat [:sequential :string]] Screen])

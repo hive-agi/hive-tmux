@@ -68,3 +68,8 @@
   (is (nil? (:input (screen/read-screen busy-screen))) "an empty prompt has no input")
   (is (= "hive workflow catchup /caveman"
          (:input (screen/read-screen (assoc busy-screen 5 "❯ hive workflow catchup /caveman  "))))))
+
+(deftest an-idle-prompt-drawn-with-a-no-break-space-has-no-input
+  ;; Captured from a live Claude Code 2.1.319 pane: bytes 342 235 257 302 240.
+  (is (nil? (:input (screen/read-screen (assoc busy-screen 5 "❯ ")))))
+  (is (= "typed" (:input (screen/read-screen (assoc busy-screen 5 "❯ typed  "))))))
