@@ -34,6 +34,7 @@
    [:ctx-tokens [:maybe nat-int?]]
    [:busy? [:maybe :boolean]]
    [:goal-active? :boolean]
+   [:goal-ended? {:optional true} :boolean]
    [:goal-age [:maybe :string]]
    [:footer-name [:maybe :string]]
    [:vim-mode [:maybe [:enum :insert :normal]]]
@@ -97,6 +98,8 @@
                (= rule-char (first t)) (= rule-char (last t)))
       (not-empty (str/trim (str/replace t (str rule-char) " "))))))
 
+(def ^:private goal-achieved-mark "Goal achieved")
+
 (defn- prompt? [line]
   (str/starts-with? (str/triml (str line)) "❯"))
 
@@ -138,7 +141,11 @@
 
    :input is whatever stands after `❯` on the prompt line. Text there was
    typed by someone (or is a dimmed suggestion, which a plain capture cannot
-   tell apart); a sender must not type over it."
+   tell apart); a sender must not type over it.
+
+   :goal-ended? is true when no goal is active and the screen still shows
+   Claude Code's `Goal achieved` line: the pane finished its goal and waits
+   for new work."
   [lines]
   (let [lines (vec lines)]
     (if-let [p (prompt-index lines)]
@@ -150,6 +157,7 @@
          :ctx-tokens (last-some ctx-tokens-of above)
          :busy? (boolean activity)
          :goal-active? (boolean goal)
+         :goal-ended? (boolean (and (not goal) (some #(str/includes? % goal-achieved-mark) (subvec lines 0 p))))
          :goal-age (:age goal)
          :footer-name (last-some footer-name-of above)
          :vim-mode (vim-mode (subvec lines p))
@@ -165,3 +173,29 @@
   [title]
   (let [t (str/trim (str title))]
     (not-empty (str/trim (apply str (drop-while (complement word-char?) t))))))
+
+(defn- rule-line? [line]
+  (let [t (utrim line)]
+    (and (seq t) (every? #(= rule-char %) t))))
+
+(defn- chrome? [line]
+  (let [t (utrim line)]
+    (or (str/blank? t)
+        (rule-line? line)
+        (some? (ctx-tokens-of line))
+        (some? (goal-of line))
+        (some? (activity-of line))
+        (some? (footer-name-of line))
+        (str/starts-with? t "⎿  Tip:")
+        (str/starts-with? t "⎿ Tip:"))))
+
+(defn body
+  "The conversation part of LINES: everything above the prompt minus the
+   chrome Claude Code draws under it (spinner, status line, tip, footer rule),
+   trailing blank lines dropped, at most N lines from the bottom. A screen with
+   no prompt is returned whole, last N lines."
+  [lines n]
+  (let [lines (vec lines)
+        above (if-let [p (prompt-index lines)] (subvec lines 0 p) lines)
+        kept (->> (rseq above) (drop-while chrome?) reverse vec)]
+    (vec (take-last n kept))))

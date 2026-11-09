@@ -174,6 +174,61 @@
                            :goal-active-after? (:goal-active? end))))))))))
     @state))
 
+(defn- start-row
+  "The pane's first row, waited to a settled idle when WAIT-IDLE? (else it
+   must already be idle). Nil when it stopped (status is set)."
+  [h state ref {:keys [wait-idle?] :as opts}]
+  (let [start (observe h ref)]
+    (swap! state assoc :status :running :pane (:pane start) :name (:name start)
+           :tokens-before (:ctx-tokens start))
+    (cond
+      (nil? start) (fail! state :no-such-pane {:ref ref})
+      wait-idle? (do (step! state :wait-idle {})
+                     (or (wait-settled-idle h ref opts (:idle-timeout-ms opts))
+                         (fail! state :timeout {:during :wait-idle})))
+      (idle? start) start
+      :else (do (swap! state assoc :status :skipped :reason :busy) nil))))
+
+(defn say!
+  "Submit OPTS :text to the pane REF names as one prompt. Waits for a settled
+   idle first unless :wait-idle? is false (then a busy pane is skipped). Done
+   once the pane starts working on it, or settles: the reply itself can take
+   an hour, read it later with `read`. Text at the prompt stops the job."
+  [h state ref opts]
+  (let [opts (merge defaults {:wait-idle? true} opts)
+        text (some-> (:text opts) str/trim not-empty)]
+    (if-not text
+      (fail! state :no-text {})
+      (when-let [_ready (start-row h state ref opts)]
+        (let [row (observe h ref)]
+          (if-let [input (:input row)]
+            (swap! state assoc :status :skipped :reason :pending-human-input
+                   :error {:during :say :input input})
+            (do (send-text! h (:pane row) text (:vim-mode row))
+                (step! state :say {:sent text})
+                (let [started (wait-until h ref :busy? opts (:start-timeout-ms opts))]
+                  (swap! state assoc :status :done :delivered true
+                         :started? (boolean started)))))))))
+  @state)
+
+(defn goal!
+  "Set the /goal of the pane REF names without compacting it: OPTS :goal
+   replaces, :goal-append extends the pane's active goal (read from its
+   transcript). Waits for a settled idle; text at the prompt stops the job."
+  [h state ref opts]
+  (let [opts (merge defaults {:wait-idle? true} opts)]
+    (when-let [ready (start-row h state ref opts)]
+      (let [captured (when (and (:goal-active? ready) (:session-id ready))
+                       (panes/goal-text (or ((:transcript h) (:cwd ready) (:session-id ready)) [])))
+            goal (goal-after opts captured)]
+        (swap! state assoc :goal goal :captured captured)
+        (if-not goal
+          (fail! state :no-goal {:note "pass goal, or goal_append on a pane whose goal is active"})
+          (when (send-and-settle! h state ref (:pane ready) (str "/goal " goal) :goal-set opts)
+            (let [end (observe h ref)]
+              (swap! state assoc :status :done :goal-active-after? (:goal-active? end))))))))
+  @state)
+
 ;;; Boundary
 
 (defonce ^:private registry (atom {}))
@@ -189,25 +244,39 @@
                         v)))
         @registry))
 
+(def ^:private runners
+  {:compact #'compact!
+   :say #'say!
+   :goal #'goal!})
+
 (defn start!
-  "Start a background compaction of the pane REF names. Returns the job map at
-   once, or {:error ...} when that pane already has a running job. The job
-   follows the pane by its tmux id, which /compact does not change. Pass :host
-   in OPTS to use another port (tests); :sync? true runs in the caller."
-  [ref {:keys [sync?] :as opts}]
+  "Start a background job on the pane REF names. OPTS :kind is :compact
+   (default), :say or :goal. Returns the job map at once, or {:error ...} when
+   that pane already has a running job. The job follows the pane by its tmux
+   id, which /compact does not change. OPTS :on-end, a fn of the final job
+   map, runs once when the job ends (how the watcher turns it into a sense).
+   Pass :host in OPTS to use another port (tests); :sync? true runs in the
+   caller."
+  [ref {:keys [sync? on-end] :as opts}]
   (let [h (or (:host opts) (host/host))
+        kind (or (:kind opts) :compact)
+        runner (get runners kind)
         row (observe h ref)]
-    (if-let [running (and row (active-for (:pane row)))]
-      {:error :already-running :job running}
-      (let [job (new-job ref opts)
+    (cond
+      (nil? runner) {:error :unknown-kind :kind kind}
+      (and row (active-for (:pane row))) {:error :already-running :job (active-for (:pane row))}
+      :else
+      (let [job (assoc (new-job ref (dissoc opts :on-end)) :kind kind)
             state (atom (assoc job :pane (:pane row)))
             follow (or (:pane row) ref)]
         (swap! registry assoc (:job-id job) state)
-        (let [work #(try (compact! h state follow (dissoc opts :host :sync?))
+        (let [work #(try (runner h state follow (dissoc opts :host :sync? :kind :on-end))
                          (catch Throwable t
                            (fail! state :threw {:message (.getMessage t)})
                            @state)
-                         (finally (swap! state assoc :ended-at (System/currentTimeMillis))))]
+                         (finally
+                           (swap! state assoc :ended-at (System/currentTimeMillis))
+                           (when on-end (guard Exception nil (on-end @state)))))]
           (if sync?
             (work)
             (do (future (work)) @state)))))))
