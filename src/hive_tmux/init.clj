@@ -16,7 +16,8 @@
             [hive-dsl.result :refer [guard rescue]]
             [taoensso.timbre :as log]
             [hive-tmux.vessel-target :as vtarget]
-            [hive-tmux.observe.lifecycle :as observe]))
+            [hive-tmux.observe.lifecycle :as observe]
+            [hive-tmux.claude.registry :as claude]))
 
 ;; Copyright (C) 2026 Pedro Gomes Branquinho (BuddhiLW) <pedrogbranquinho@gmail.com>
 ;;
@@ -49,9 +50,12 @@
 
         (addon-type [_] :native)
 
-        (capabilities [_] #{:terminal :health-reporting :vessel})
+        (capabilities [_] #{:terminal :health-reporting :vessel :tools :schema})
 
         (initialize! [_ config]
+          ;; `swarm tmux ...` needs only the tmux CLI, so it is contributed
+          ;; before the libtmux preflight and survives its failure.
+          (claude/contribute!)
           (if (:initialized? @state)
             {:success? true :already-initialized? true}
             ;; Step 1: Preflight — Python, libtmux, tmux binary
@@ -126,6 +130,7 @@
                                :errors ["Terminal registry not available — is hive-mcp loaded?"]})))))))))))
 
         (shutdown! [_]
+          (claude/retract!)
           (when (:initialized? @state)
             ;; Uninstall swarm event bridge (restores log-only handlers)
             (do
@@ -148,7 +153,7 @@
 
         (tools [_] [])
 
-        (schema-extensions [_] {})
+        (schema-extensions [_] {claude/host-tool claude/schema-ext})
 
         ;; The hive-vessel target: :text natives through the tmux CLI on the
         ;; session the python bridge drives. Contributed only while active and
