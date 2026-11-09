@@ -29,15 +29,16 @@
   "A host whose single pane %9 runs \"peer one\". Each submitted line makes the
    pane busy for two polls; /compact drops the tokens and clears the goal, and
    /goal sets it again. :sent records every submitted line in order."
-  [{:keys [tokens goal? transcript]}]
+  [{:keys [tokens goal? transcript after-submit] :or {after-submit (fn [s _line] s)}}]
   (let [st (atom {:tokens tokens :busy-polls 0 :goal? goal? :clock 0
                   :typed "" :sent [] :argv []})
         submit! (fn [line]
                   (swap! st (fn [s]
-                              (cond-> (-> s (update :sent conj line) (assoc :busy-polls 2 :typed ""))
-                                (str/starts-with? line "/compact") (assoc :tokens 30000 :goal? false)
-                                (str/starts-with? line "/goal ") (assoc :goal? true)
-                                (= line "hive workflow catchup /caveman") (update :tokens + 20000)))))]
+                              (-> (cond-> (-> s (update :sent conj line) (assoc :busy-polls 2 :typed ""))
+                                    (str/starts-with? line "/compact") (assoc :tokens 30000 :goal? false)
+                                    (str/starts-with? line "/goal ") (assoc :goal? true)
+                                    (= line "hive workflow catchup /caveman") (update :tokens + 20000))
+                                  (after-submit line)))))]
     {:state st
      :host
      {:tmux! (fn tmux!
@@ -74,6 +75,46 @@
     (is (= 50000 (:tokens-after job)))
     (is (true? (:goal-active-after? job)))
     (is (= goal-text (:goal job)))))
+
+(defn- busy-forever-after-goal
+  "The peer starts working under a new /goal at once and does not stop."
+  [s line]
+  (cond-> s (str/starts-with? line "/goal ") (assoc :busy-polls 1000000)))
+
+(deftest the-last-send-ends-the-job-even-when-the-pane-keeps-working
+  (testing "compact: the restored goal sets the peer to work, the job is still :done"
+    (let [{:keys [state host]} (scripted-host {:tokens 450000 :goal? true
+                                               :transcript [(goal-line goal-text)]
+                                               :after-submit busy-forever-after-goal})
+          ended (atom nil)
+          job (compact/start! "%9" (assoc fast :host host :on-end #(reset! ended %)))]
+      (is (= :done (:status job)) (pr-str (dissoc job :steps)))
+      (is (true? (:started? job)))
+      (is (true? (:goal-active-after? job)))
+      (is (= (str "/goal " goal-text) (last (:sent @state))))
+      (is (= :done (:status @ended)) "on-end fired, so the tmux-job sense can fire")))
+  (testing "goal: the same for a goal set without compacting"
+    (let [{:keys [host]} (scripted-host {:tokens 100000 :goal? false
+                                         :after-submit busy-forever-after-goal})
+          job (compact/start! "%9" (assoc fast :host host :kind :goal :goal "Take the next card."))]
+      (is (= [:done true] [(:status job) (:started? job)]))))
+  (testing "compact with no goal to restore: the reseed is the last send"
+    (let [{:keys [state host]} (scripted-host {:tokens 450000 :goal? false
+                                               :after-submit (fn [s line]
+                                                               (cond-> s (= line "hive workflow catchup /caveman")
+                                                                 (assoc :busy-polls 1000000)))})
+          job (compact/start! "%9" (assoc fast :host host))]
+      (is (= [:done true] [(:status job) (:started? job)]))
+      (is (= ["/compact" "hive workflow catchup /caveman"] (:sent @state))))))
+
+(deftest an-unacknowledged-last-send-is-done-not-started
+  (let [{:keys [host]} (scripted-host {:tokens 100000 :goal? false
+                                       :after-submit (fn [s line]
+                                                       (cond-> s (str/starts-with? line "/goal ")
+                                                         (assoc :busy-polls 0 :goal? false)))})
+        job (compact/start! "%9" (assoc fast :host host :kind :goal :goal "Take the next card."))]
+    (is (= :done (:status job)))
+    (is (false? (:started? job)) "the pane never showed it working nor the goal active")))
 
 (deftest under-threshold-is-skipped-unless-forced
   (let [{:keys [state host]} (scripted-host {:tokens 100000 :goal? false})]
