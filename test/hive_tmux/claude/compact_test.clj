@@ -3,7 +3,7 @@
    reacts to what is typed into it. No tmux, no ~/.claude, no real clock."
   (:require [clojure.data.json :as json]
             [clojure.string :as str]
-            [clojure.test :refer [deftest is]]
+            [clojure.test :refer [deftest is testing]]
             [hive-tmux.claude.compact :as compact]
             [hive-tmux.claude.panes :as panes]
             [hive-tmux.claude.registry :as registry]
@@ -18,11 +18,11 @@
                                            "<command-message>goal</command-message>\n"
                                            "<command-args>" args "</command-args>")}}))
 
-(defn- screen [{:keys [tokens busy-polls goal?]}]
+(defn- screen [{:keys [tokens busy-polls goal? human]}]
   [(if (pos? busy-polls) "✶ Compacting… (12s · ↓ 1k tokens)" "✻ Worked for 2s")
    (str "   " tokens " tokens" (when goal? " · ◎ /goal active (3m)"))
    "──────────── peer one ─"
-   "❯ "
+   (str "❯ " human)
    "  -- INSERT -- ⏵⏵ auto mode on"])
 
 (defn scripted-host
@@ -103,3 +103,30 @@
         (is (empty? (get-in (registry/dispatch (assoc h-params :exclude "peer one")) [:ok :would-compact])))
         (is (empty? (get-in (registry/dispatch (assoc h-params :threshold 500000)) [:ok :would-compact])))))
     (is (empty? (:sent @state)) "a dry run types nothing")))
+
+(deftest text-a-human-left-at-the-prompt-is-never-typed-over
+  (let [{:keys [state host]} (scripted-host {:tokens 450000 :goal? true
+                                             :transcript [(goal-line goal-text)]})]
+    (swap! state assoc :human "hive workflow catchup /caveman")
+    (let [job (compact/start! "%9" (assoc fast :host host))]
+      (is (= :skipped (:status job)))
+      (is (= :pending-human-input (:reason job)))
+      (is (= "hive workflow catchup /caveman" (get-in job [:error :input])))
+      (is (empty? (:sent @state)) "not one key was sent")
+      (is (not-any? #(= "send-keys" (first %)) (:argv @state))))))
+
+(deftest a-supervisor-can-replace-or-extend-the-goal
+  (testing "goal replaces the captured one"
+    (let [{:keys [state host]} (scripted-host {:tokens 450000 :goal? true
+                                               :transcript [(goal-line goal-text)]})]
+      (compact/start! "%9" (assoc fast :host host :goal "Take card 7b90138c."))
+      (is (= "/goal Take card 7b90138c." (last (:sent @state))))))
+  (testing "goal_append extends the captured one"
+    (let [{:keys [state host]} (scripted-host {:tokens 450000 :goal? true
+                                               :transcript [(goal-line goal-text)]})]
+      (compact/start! "%9" (assoc fast :host host :goal-append "Then keep pulling cards."))
+      (is (= (str "/goal " goal-text " Then keep pulling cards.") (last (:sent @state))))))
+  (testing "a goal can be set on a pane that had none"
+    (let [{:keys [state host]} (scripted-host {:tokens 450000 :goal? false})]
+      (compact/start! "%9" (assoc fast :host host :goal "Start the loop."))
+      (is (= "/goal Start the loop." (last (:sent @state)))))))

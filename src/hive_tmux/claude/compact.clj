@@ -106,20 +106,37 @@
 
 (defn- send-and-settle!
   "Send TEXT, wait for the turn it starts to end. Returns the idle row, or nil
-   when it timed out (status :failed is set)."
+   when it stopped (status is set). Text standing at the prompt is someone's
+   unsent input: nothing is typed over it, the job stops as
+   :pending-human-input instead."
   [h state ref pane-id text step-key opts]
   (let [row (observe h ref)]
-    (send-text! h pane-id text (:vim-mode row))
-    (step! state step-key {:sent text})
-    ;; The turn may start and end between two polls; seeing busy is not required.
-    (wait-until h ref :busy? opts (:start-timeout-ms opts))
-    (or (wait-settled-idle h ref opts (:step-timeout-ms opts))
-        (fail! state :timeout {:during step-key}))))
+    (if-let [input (:input row)]
+      (do (swap! state assoc :status :skipped :reason :pending-human-input
+                 :error {:during step-key :input input})
+          nil)
+      (do
+        (send-text! h pane-id text (:vim-mode row))
+        (step! state step-key {:sent text})
+        ;; The turn may start and end between two polls; seeing busy is not required.
+        (wait-until h ref :busy? opts (:start-timeout-ms opts))
+        (or (wait-settled-idle h ref opts (:step-timeout-ms opts))
+            (fail! state :timeout {:during step-key}))))))
+
+(defn goal-after
+  "The goal to set after the re-seed. GOAL (an override) wins over CAPTURED;
+   APPEND is added to whichever applies. Nil when there is nothing to set."
+  [{:keys [goal goal-append]} captured]
+  (let [base (or (some-> goal str/trim not-empty) captured)
+        extra (some-> goal-append str/trim not-empty)]
+    (cond (and base extra) (str base " " extra)
+          :else (or base extra))))
 
 (defn compact!
   "Compact the pane REF names, through host H, recording progress in STATE
-   (an atom). OPTS: see `defaults`, plus :force? (ignore the threshold) and
-   :instructions (text after /compact). Returns STATE's final value."
+   (an atom). OPTS: see `defaults`, plus :force? (ignore the threshold),
+   :instructions (text after /compact), :goal (replace the goal) and
+   :goal-append (extend it). Returns STATE's final value."
   [h state ref opts]
   (let [opts (merge defaults opts)
         start (observe h ref)]
@@ -137,11 +154,13 @@
         (when-let [ready (do (step! state :wait-idle {})
                              (or (wait-settled-idle h ref opts (:idle-timeout-ms opts))
                                  (fail! state :timeout {:during :wait-idle})))]
-          (let [goal (when (and (:restore-goal? opts) (:goal-active? ready) (:session-id ready))
-                       (panes/goal-text (or ((:transcript h) (:cwd ready) (:session-id ready)) [])))]
-            (step! state :goal-captured {:goal goal :goal-active? (:goal-active? ready)})
+          (let [captured (when (and (:restore-goal? opts) (:goal-active? ready) (:session-id ready))
+                           (panes/goal-text (or ((:transcript h) (:cwd ready) (:session-id ready)) [])))
+                goal (goal-after opts captured)]
+            (step! state :goal-captured {:captured captured :goal goal
+                                         :goal-active? (:goal-active? ready)})
             (swap! state assoc :goal goal)
-            (when (and (:goal-active? ready) (:restore-goal? opts) (nil? goal))
+            (when (and (:goal-active? ready) (:restore-goal? opts) (nil? captured) (nil? (:goal opts)))
               (step! state :goal-unreadable {:note "goal active but no /goal text in the transcript; it will not be restored"}))
             (when (send-and-settle! h state ref pane-id
                                     (str "/compact" (some->> (:instructions opts) str/trim not-empty (str " ")))

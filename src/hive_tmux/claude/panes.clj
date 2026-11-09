@@ -112,7 +112,8 @@
              :goal-active? (:goal-active? facts)
              :goal-age (:goal-age facts)
              :activity (:activity facts)
-             :vim-mode (:vim-mode facts)}
+             :vim-mode (:vim-mode facts)
+             :input (:input facts)}
       ambiguous? (assoc :ambiguous? true)
       (nil? session) (assoc :unjoined? true))))
 

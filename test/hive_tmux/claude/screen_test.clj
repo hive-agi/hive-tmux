@@ -63,3 +63,8 @@
   (is (nil? (screen/footer-name-of "─────────────")))
   (is (= "caveman catchup trigger" (screen/title-name "✳ caveman catchup trigger")))
   (is (= "OC | Processing" (screen/title-name "OC | Processing"))))
+
+(deftest the-prompt-line-reports-pending-input
+  (is (nil? (:input (screen/read-screen busy-screen))) "an empty prompt has no input")
+  (is (= "hive workflow catchup /caveman"
+         (:input (screen/read-screen (assoc busy-screen 5 "❯ hive workflow catchup /caveman  "))))))

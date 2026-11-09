@@ -60,6 +60,8 @@
     (contains? params :reseed) (assoc :reseed (str (:reseed params)))
     (some? (:restore_goal params)) (assoc :restore-goal? (bool (:restore_goal params) true))
     (:instructions params) (assoc :instructions (str (:instructions params)))
+    (:goal params) (assoc :goal (str (:goal params)))
+    (:goal_append params) (assoc :goal-append (str (:goal_append params)))
     (bool (:force params) false) (assoc :force? true)))
 
 (defn compact-cmd
@@ -103,7 +105,7 @@
               :params [:include_goal :socket_name]}
    "compact" {:fn compact-cmd
               :doc "Wait idle, capture the /goal, send /compact, re-seed (default \"hive workflow catchup /caveman\"), restore the goal. pane=<ref,...> compacts those panes whatever their size; no pane = every pane over threshold (default 400000) minus exclude. Background job; returns job ids."
-              :params [:pane :threshold :reseed :restore_goal :instructions :exclude :force :dry_run :socket_name]}
+              :params [:pane :threshold :reseed :restore_goal :goal :goal_append :instructions :exclude :force :dry_run :socket_name]}
    "job"     {:fn job-cmd
               :doc "One compaction job by job_id with its steps, or every job without."
               :params [:job_id]}})
@@ -159,7 +161,10 @@
    "dry_run"      {:type "boolean" :description "[tmux compact] List what would be compacted; start nothing."}
    "include_goal" {:type "boolean" :description "[tmux panes] Also read each goal-active pane's /goal text."}
    "socket_name"  {:type "string" :description "[tmux panes|compact] tmux -L socket; default server when omitted."}
+   "goal"         {:type "string" :description "[tmux compact] Goal to set after the re-seed, replacing the pane's own /goal."}
+   "goal_append"  {:type "string" :description "[tmux compact] Text appended to the goal that is set (the captured one, or `goal`)."}
    "job_id"       {:type "string" :description "[tmux job] Compaction job id from tmux compact."}})
+
 
 (def addon-key
   "Ownership key for contributions, so retraction removes only ours."

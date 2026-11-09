@@ -37,7 +37,8 @@
    [:goal-age [:maybe :string]]
    [:footer-name [:maybe :string]]
    [:vim-mode [:maybe [:enum :insert :normal]]]
-   [:activity [:maybe :string]]])
+   [:activity [:maybe :string]]
+   [:input [:maybe :string]]])
 
 (def ^:private segment-sep " · ")
 (def ^:private goal-mark "◎ /goal active")
@@ -115,19 +116,23 @@
         :else nil))
 
 (def ^:private unread
-  {:claude? false :ctx-tokens nil :busy? nil :goal-active? false
-   :goal-age nil :footer-name nil :vim-mode nil :activity nil})
+  {:claude? false :ctx-tokens nil :busy? nil :goal-active? false :goal-age nil :footer-name nil :vim-mode nil :activity nil :input nil})
 
 (defn read-screen
   "The facts of LINES, a pane capture top to bottom. A screen with no prompt
    is `:claude? false` with every fact nil: not a Claude Code pane, or one
-   mid-redraw, and either way nothing on it can be trusted."
+   mid-redraw, and either way nothing on it can be trusted.
+
+   :input is whatever stands after `❯` on the prompt line. Text there was
+   typed by someone (or is a dimmed suggestion, which a plain capture cannot
+   tell apart); a sender must not type over it."
   [lines]
   (let [lines (vec lines)]
     (if-let [p (prompt-index lines)]
       (let [above (subvec lines (max 0 (- p 12)) p)
             goal (last-some goal-of above)
-            activity (last-some activity-of above)]
+            activity (last-some activity-of above)
+            prompt-line (str/triml (nth lines p))]
         {:claude? true
          :ctx-tokens (last-some ctx-tokens-of above)
          :busy? (boolean activity)
@@ -135,7 +140,8 @@
          :goal-age (:age goal)
          :footer-name (last-some footer-name-of above)
          :vim-mode (vim-mode (subvec lines p))
-         :activity activity})
+         :activity activity
+         :input (not-empty (str/trim (subs prompt-line 1)))})
       unread)))
 
 (m/=> read-screen [:=> [:cat [:sequential :string]] Screen])
