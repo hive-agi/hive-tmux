@@ -46,12 +46,30 @@
          (run-ticks [[(row {:ctx-tokens 390000})] [(row {:ctx-tokens 401000})] [(row {:ctx-tokens 420000})]
                      [(row {:ctx-tokens 40000})] [(row {:ctx-tokens 405000})]]))))
 
+(deftest pane-waiting-fires-once-per-waiting-spell
+  (is (= [[:pane-waiting "%1"]]
+         (run-ticks [[(row {:status :busy})] [(row {:status :waiting})]]))
+      "the edge into :waiting fires")
+  (is (= [[:pane-waiting "%1"]]
+         (run-ticks [[(row {:status :busy})] [(row {:status :waiting})]
+                     [(row {:status :waiting})] [(row {:status :waiting})]]))
+      "staying :waiting does not fire again")
+  (is (empty? (run-ticks [[(row {:status :waiting})] [(row {:status :waiting})]]))
+      "the seed tick fires nothing, and a pane already waiting then is not news")
+  (testing "a new waiting spell fires again"
+    (is (= [[:pane-waiting "%1"] [:pane-waiting "%1"]]
+           (run-ticks [[(row {:status :busy})] [(row {:status :waiting})]
+                       [(row {:status :busy})] [(row {:status :waiting})]]))))
+  (testing "the shout data carries the status"
+    (is (= "waiting" (:tmux-status (watch/row-data (row {:status :waiting})))))
+    (is (= "pane_status" (sense/detail-keys :tmux-status)))))
+
 (deftest excluded-panes-are-never-tracked
   (is (empty? (run-ticks [[(row {})] [(row {:busy? true})] [(row {})] [(row {})]]
                          :o (assoc opts :exclude ["peer"])))))
 
 (deftest every-event-has-a-sense-class
-  (is (= #{:pane-idle :goal-ended :context-high :tmux-job} (set (keys sense/event->class))))
+  (is (= #{:pane-idle :goal-ended :context-high :pane-waiting :tmux-job} (set (keys sense/event->class))))
   (testing "a class perceives exactly its own event type"
     (let [specs (sense/class-specs)
           by (into {} (map (juxt :sense/class identity) specs))]
