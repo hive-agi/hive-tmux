@@ -1,6 +1,7 @@
 (ns hive-tmux.claude.screen-test
   (:require [clojure.test :refer [deftest is testing]]
-            [hive-tmux.claude.screen :as screen]))
+            [hive-tmux.claude.screen :as screen]
+            [clojure.string :as str]))
 
 (def busy-screen
   ["● hive - swarm (MCP)(command: \"ss wait\", parent: \"coordinator:70283\", timeout_ms: 100000)"
@@ -73,3 +74,18 @@
   ;; Captured from a live Claude Code 2.1.319 pane: bytes 342 235 257 302 240.
   (is (nil? (:input (screen/read-screen (assoc busy-screen 5 "❯ ")))))
   (is (= "typed" (:input (screen/read-screen (assoc busy-screen 5 "❯ typed  "))))))
+
+(deftest goal-achieved-on-screen-without-an-active-goal-is-goal-ended
+  (let [lines ["● All cards closed." "✔ Goal achieved" "✻ Worked for 9m"
+               "   88000 tokens · current: 2.1.319" "──── peer ─" "❯ "]]
+    (is (true? (:goal-ended? (screen/read-screen lines))))
+    (is (false? (:goal-ended? (screen/read-screen (assoc lines 3 "   88000 tokens · ◎ /goal active (1m)"))))
+        "an active goal means a new one started")))
+
+(deftest body-strips-the-chrome-under-the-conversation
+  (let [b (screen/body (into ["● Done. Card closed." "  PR #12 merged." ""] busy-screen) 10)]
+    (is (= "● Done. Card closed." (first b)))
+    (is (str/starts-with? (last b) "● hive - swarm (MCP)") "a tool call is conversation, kept")
+    (is (not-any? #(str/includes? % "Percolating") b) "the spinner is chrome")
+    (is (not-any? #(str/includes? % "tokens ·") b) "the status line is chrome")
+    (is (not-any? #(str/includes? % "Tip:") b) "the tip is chrome")))

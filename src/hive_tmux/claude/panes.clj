@@ -92,6 +92,22 @@
     (when-not (or (str/blank? args) (#{"clear" "off" "stop"} (str/lower-case args)))
       args)))
 
+(defn last-assistant-text
+  "The text of the newest assistant message in LINES (a transcript, oldest
+   first) that says something: thinking and tool calls are skipped. Nil when
+   there is none."
+  [lines]
+  (some (fn [line]
+          (when (str/includes? line "\"assistant\"")
+            (let [entry (guard Exception nil (json/read-str line :key-fn keyword))
+                  content (get-in entry [:message :content])
+                  text (when (= "assistant" (:type entry))
+                         (if (string? content)
+                           content
+                           (->> content (filter #(= "text" (:type %))) (keep :text) (str/join "\n"))))]
+              (not-empty (some-> text str/trim)))))
+        (rseq (vec lines))))
+
 (defn pane-row
   "One pane's row from its tmux PANE map, its SCREEN facts and SESSIONS."
   [pane facts sessions]
@@ -110,6 +126,7 @@
              :ctx-tokens (:ctx-tokens facts)
              :busy? (boolean (or (:busy? facts) (= :busy status)))
              :goal-active? (:goal-active? facts)
+             :goal-ended? (boolean (:goal-ended? facts))
              :goal-age (:goal-age facts)
              :activity (:activity facts)
              :vim-mode (:vim-mode facts)

@@ -130,3 +130,36 @@
     (let [{:keys [state host]} (scripted-host {:tokens 450000 :goal? false})]
       (compact/start! "%9" (assoc fast :host host :goal "Start the loop."))
       (is (= "/goal Start the loop." (last (:sent @state)))))))
+
+(deftest say-submits-one-prompt-and-ends-when-the-pane-starts-on-it
+  (let [{:keys [state host]} (scripted-host {:tokens 100000 :goal? true})
+        ended (atom nil)
+        job (compact/start! "%9" (assoc fast :host host :kind :say :text "close the loop: run wrap"
+                                        :on-end #(reset! ended %)))]
+    (is (= :done (:status job)))
+    (is (= :say (:kind job)))
+    (is (true? (:delivered job)))
+    (is (= ["close the loop: run wrap"] (:sent @state)) "no /compact, no re-seed, only the prompt")
+    (is (= (:job-id job) (:job-id @ended)) "on-end saw the finished job")))
+
+(deftest say-never-types-over-pending-input
+  (let [{:keys [state host]} (scripted-host {:tokens 100000 :goal? false})]
+    (swap! state assoc :human "half a sentence")
+    (let [job (compact/start! "%9" (assoc fast :host host :kind :say :text "hello"))]
+      (is (= [:skipped :pending-human-input] [(:status job) (:reason job)]))
+      (is (empty? (:sent @state))))))
+
+(deftest goal-arms-a-goal-without-compacting
+  (let [{:keys [state host]} (scripted-host {:tokens 100000 :goal? false})
+        job (compact/start! "%9" (assoc fast :host host :kind :goal :goal "Take the next card."))]
+    (is (= :done (:status job)))
+    (is (= ["/goal Take the next card."] (:sent @state)))
+    (is (true? (:goal-active-after? job))))
+  (testing "goal_append needs an active goal or an explicit one"
+    (let [{:keys [host]} (scripted-host {:tokens 100000 :goal? false})
+          job (compact/start! "%9" (assoc fast :host host :kind :goal :goal-append "more"))]
+      (is (= "more" (:goal job)) "append alone becomes the goal when none is active"))))
+
+(deftest an-unknown-kind-is-refused
+  (let [{:keys [host]} (scripted-host {:tokens 1 :goal? false})]
+    (is (= :unknown-kind (:error (compact/start! "%9" (assoc fast :host host :kind :dance)))))))
