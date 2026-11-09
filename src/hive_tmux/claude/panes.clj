@@ -26,12 +26,13 @@
 ;; SPDX-License-Identifier: MIT
 
 (def ^:private fields
-  [:pane :session :window :index :pid :command :cwd :title])
+  [:pane :session :window :index :pid :command :cwd :title :tty :dead :active])
 
 (def ^:private list-format
   (str/join "\t" ["#{pane_id}" "#{session_name}" "#{window_index}" "#{pane_index}"
                   "#{pane_pid}" "#{pane_current_command}" "#{pane_current_path}"
-                  "#{pane_title}"]))
+                  "#{pane_title}" "#{pane_tty}" "#{pane_dead}"
+                  "#{?#{&&:#{pane_active},#{window_active}},1,0}"]))
 
 (defn- split-on
   "S split at every SEP (a string), keeping empty fields."
@@ -49,7 +50,8 @@
   (->> (split-on (str out) "\n")
        (remove str/blank?)
        (map #(zipmap fields (split-on % "\t")))
-       (map #(assoc % :target (str (:session %) ":" (:window %) "." (:index %))))
+       (map #(assoc % :target (str (:session %) ":" (:window %) "." (:index %))
+                    :dead (= "1" (:dead %)) :active (= "1" (:active %))))
        vec))
 
 (defn join-session
@@ -111,8 +113,11 @@
 (defn pane-row
   "One pane's row from its tmux PANE map, its SCREEN facts and SESSIONS."
   [pane facts sessions]
-  (let [name* (or (:footer-name facts) (screen/title-name (:title pane)))
-        {:keys [session ambiguous?]} (join-session sessions name* (:cwd pane))
+  (let [title-name (screen/title-name (:title pane))
+        names (distinct (remove nil? [(:footer-name facts) title-name]))
+        [name* joined] (or (some #(when-let [j (join-session sessions % (:cwd pane))] [% j]) names)
+                           [(first names) nil])
+        {:keys [session ambiguous?]} joined
         status (some-> (:status session) keyword)]
     (cond-> {:pane (:pane pane)
              :target (:target pane)
@@ -130,7 +135,12 @@
              :goal-age (:goal-age facts)
              :activity (:activity facts)
              :vim-mode (:vim-mode facts)
-             :input (:input facts)}
+             :input (:input facts)
+             :tty (not-empty (:tty pane))
+             :footer-name (:footer-name facts)
+             :session-tmux (:tmux session)
+             :pane-active? (boolean (:active pane))
+             :pane-dead? (boolean (:dead pane))}
       ambiguous? (assoc :ambiguous? true)
       (nil? session) (assoc :unjoined? true))))
 
