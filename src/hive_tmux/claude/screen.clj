@@ -178,6 +178,15 @@
   (let [t (utrim line)]
     (and (seq t) (every? #(= rule-char %) t))))
 
+(defn- finished-turn?
+  "`✻ Worked for 3m 12s` (any verb): one glyph, a word, `for`, a duration."
+  [t]
+  (let [[glyph more] (cut t " ")
+        [_word tail] (when more (cut more " "))]
+    (boolean (and tail (= 1 (count glyph)) (not (word-char? (first glyph)))
+                  (str/starts-with? tail "for ")
+                  (some-> (subs tail 4) first Character/isDigit)))))
+
 (defn- chrome? [line]
   (let [t (utrim line)]
     (or (str/blank? t)
@@ -186,16 +195,18 @@
         (some? (goal-of line))
         (some? (activity-of line))
         (some? (footer-name-of line))
-        (str/starts-with? t "⎿  Tip:")
-        (str/starts-with? t "⎿ Tip:"))))
+        (finished-turn? t)
+        (and (str/starts-with? t "⎿") (str/starts-with? (utrim (subs t 1)) "Tip:")))))
 
 (defn body
   "The conversation part of LINES: everything above the prompt minus the
-   chrome Claude Code draws under it (spinner, status line, tip, footer rule),
-   trailing blank lines dropped, at most N lines from the bottom. A screen with
-   no prompt is returned whole, last N lines."
+   chrome Claude Code draws under it (spinner, finished-turn line, status line,
+   tip, footer rule), trailing blank lines dropped, at most N lines from the
+   bottom. A screen with no prompt is returned whole, last N lines. No-break
+   spaces, which Claude Code draws inside its chrome (`⎿` + U+00A0 + `Tip:`),
+   read as plain spaces."
   [lines n]
-  (let [lines (vec lines)
+  (let [lines (mapv #(str/replace (str %) " " " ") lines)
         above (if-let [p (prompt-index lines)] (subvec lines 0 p) lines)
         kept (->> (rseq above) (drop-while chrome?) reverse vec)]
     (vec (take-last n kept))))

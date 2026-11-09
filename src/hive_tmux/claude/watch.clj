@@ -143,7 +143,7 @@
                (swap! w assoc :last-error (.getMessage t))
                (log/warn "[claude-watch] tick failed" (.getMessage t))))
         (Thread/sleep (long (:interval-ms opts)))))
-    (dissoc @w :host :states)))
+    (-> @w (dissoc :host :states) (update :opts dissoc :host :shout-fn))))
 
 (defn status []
   (if-let [w @watcher]
