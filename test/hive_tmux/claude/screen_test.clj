@@ -89,3 +89,20 @@
     (is (not-any? #(str/includes? % "Percolating") b) "the spinner is chrome")
     (is (not-any? #(str/includes? % "tokens ·") b) "the status line is chrome")
     (is (not-any? #(str/includes? % "Tip:") b) "the tip is chrome")))
+
+(deftest body-strips-live-chrome-drawn-with-no-break-spaces
+  ;; Shapes captured from live Claude Code 2.1.319 panes on 2026-11-09.
+  (let [lines ["● Five lings are running."
+               ""
+               "✶ Lollygagging… (11m 59s · ↓ 31.9k tokens)"
+               "  ⎿  Tip: Use /btw to ask a quick side question"
+               "   203674 tokens · ◎ /goal active (23m)"
+               "──── caveman mode bootstrap ─"
+               "❯ "]]
+    (is (= ["● Five lings are running."] (screen/body lines 10))))
+  (is (= ["● last reply: answered"]
+         (screen/body ["● last reply: answered" "✻ Worked for 4s" "   151000 tokens" "──── fake peer ─" "❯ "] 10))
+      "the finished-turn line is chrome")
+  (is (= ["✻ Worked for nothing, a sentence"]
+         (screen/body ["✻ Worked for nothing, a sentence" "❯ "] 10))
+      "only a duration after `for` makes it chrome"))
