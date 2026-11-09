@@ -3,7 +3,7 @@
  :addon/type         :native
  :addon/init-ns      "hive-tmux.init"
  :addon/init-fn      "addon-ctor"
- :addon/capabilities #{:terminal :health-reporting :vessel}
- :addon/description  "tmux terminal backend via libtmux Python interop"
+ :addon/capabilities #{:terminal :health-reporting :vessel :tools :schema}
+ :addon/description  "tmux terminal backend via libtmux Python interop, plus `swarm tmux panes|compact|job`: Claude Code panes as data and compaction that re-seeds and restores the /goal"
  :addon/maturity :stable
  :addon/trust-class :foss}
