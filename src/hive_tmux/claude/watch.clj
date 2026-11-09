@@ -11,6 +11,8 @@
      :pane-idle     a pane seen working is idle on two ticks in a row
      :goal-ended    goal-active? went true -> false, or `Goal achieved` appeared
      :context-high  ctx-tokens went from under the threshold to at or over it
+     :pane-waiting  the session status went to :waiting (a permission or other
+                    human prompt); once per waiting spell
      :tmux-job      a compact | say | goal job ended (via `job-ended!`)
 
    The first tick only seeds: a pane already idle when the watch starts is not
@@ -48,16 +50,20 @@
                              (and (:goal-ended? row) (not (:goal-ended? prev)))))
         ctx (:ctx-tokens row)
         high? (boolean (and (not seed?) ctx (>= ctx threshold)
-                            (some-> (:ctx-tokens prev) (< threshold))))]
+                            (some-> (:ctx-tokens prev) (< threshold))))
+        waiting (= :waiting (:status row))
+        waiting? (and (not seed?) waiting (not (:waiting? prev)))]
     [{:idle-streak streak
       :worked? (if idle-event? false worked)
       :goal-active? (:goal-active? row)
       :goal-ended? (:goal-ended? row)
+      :waiting? waiting
       :ctx-tokens (or ctx (:ctx-tokens prev))}
      (cond-> []
        idle-event? (conj [:pane-idle row])
        goal-ended? (conj [:goal-ended row])
-       high? (conj [:context-high row]))]))
+       high? (conj [:context-high row])
+       waiting? (conj [:pane-waiting row]))]))
 
 (defn step
   "All panes: STATES (pane id -> state) and ROWS now -> {:states :events}.
@@ -79,14 +85,16 @@
   (into {} (remove (comp nil? val))
         {:tmux-pane (:pane row) :tmux-target (:target row) :tmux-name (:name row)
          :tmux-session-id (:session-id row) :tmux-cwd (:cwd row)
-         :tmux-ctx-tokens (:ctx-tokens row) :tmux-goal-active (:goal-active? row)}))
+         :tmux-ctx-tokens (:ctx-tokens row) :tmux-goal-active (:goal-active? row)
+         :tmux-status (some-> (:status row) name)}))
 
 (defn- message [event row]
   (case event
     :pane-idle (str (:name row) " (" (:target row) ") is idle"
                     (if (:goal-active? row) ", goal still active" ", no goal active"))
     :goal-ended (str (:name row) " (" (:target row) ") goal ended")
-    :context-high (str (:name row) " (" (:target row) ") context at " (:ctx-tokens row) " tokens")))
+    :context-high (str (:name row) " (" (:target row) ") context at " (:ctx-tokens row) " tokens")
+    :pane-waiting (str (:name row) " (" (:target row) ") is waiting on a human (permission or prompt)")))
 
 ;;; Boundary
 

@@ -104,24 +104,43 @@
   (swap! state assoc :status :failed :reason reason :error data)
   nil)
 
-(defn- send-and-settle!
-  "Send TEXT, wait for the turn it starts to end. Returns the idle row, or nil
-   when it stopped (status is set). Text standing at the prompt is someone's
-   unsent input: nothing is typed over it, the job stops as
-   :pending-human-input instead."
-  [h state ref pane-id text step-key opts]
+(defn- deliver!
+  "Type TEXT unless text already stands at the prompt: that is someone's
+   unsent input, nothing is typed over it and the job stops as
+   :pending-human-input. True when TEXT was sent."
+  [h state ref pane-id text step-key]
   (let [row (observe h ref)]
     (if-let [input (:input row)]
       (do (swap! state assoc :status :skipped :reason :pending-human-input
                  :error {:during step-key :input input})
-          nil)
-      (do
-        (send-text! h pane-id text (:vim-mode row))
-        (step! state step-key {:sent text})
-        ;; The turn may start and end between two polls; seeing busy is not required.
-        (wait-until h ref :busy? opts (:start-timeout-ms opts))
-        (or (wait-settled-idle h ref opts (:step-timeout-ms opts))
-            (fail! state :timeout {:during step-key}))))))
+          false)
+      (do (send-text! h pane-id text (:vim-mode row))
+          (step! state step-key {:sent text})
+          true))))
+
+(defn- send-and-settle!
+  "Send TEXT, wait for the turn it starts to end. Returns the idle row, or nil
+   when it stopped (status is set). For an intermediate step: the next send
+   must not land on a working pane."
+  [h state ref pane-id text step-key opts]
+  (when (deliver! h state ref pane-id text step-key)
+    ;; The turn may start and end between two polls; seeing busy is not required.
+    (wait-until h ref :busy? opts (:start-timeout-ms opts))
+    (or (wait-settled-idle h ref opts (:step-timeout-ms opts))
+        (fail! state :timeout {:during step-key}))))
+
+(defn- send-and-start!
+  "Send TEXT as a job's LAST step and end on the pane's acknowledgement: seen
+   working, or, for a /goal, the goal shown active, within :start-timeout-ms.
+   Waiting for idle here would wait on the very work the send restarts.
+   {:started? bool :row row}; an unacknowledged delivery is :started? false,
+   not a hang. Nil when pending input stopped it (status is set)."
+  [h state ref pane-id text step-key opts]
+  (when (deliver! h state ref pane-id text step-key)
+    (let [goal? (str/starts-with? text "/goal ")
+          seen (wait-until h ref #(boolean (or (:busy? %) (and goal? (:goal-active? %))))
+                           opts (:start-timeout-ms opts))]
+      {:started? (boolean seen) :row (or seen (observe h ref))})))
 
 (defn goal-after
   "The goal to set after the re-seed. GOAL (an override) wins over CAPTURED;
@@ -165,13 +184,19 @@
             (when (send-and-settle! h state ref pane-id
                                     (str "/compact" (some->> (:instructions opts) str/trim not-empty (str " ")))
                                     :compact opts)
-              (when (or (str/blank? (:reseed opts))
-                        (send-and-settle! h state ref pane-id (:reseed opts) :reseed opts))
-                (when (or (nil? goal)
-                          (send-and-settle! h state ref pane-id (str "/goal " goal) :goal-restored opts))
-                  (let [end (observe h ref)]
-                    (swap! state assoc :status :done :tokens-after (:ctx-tokens end)
-                           :goal-active-after? (:goal-active? end))))))))))
+              ;; The last send restarts work: it ends the job once acknowledged.
+              (let [reseed (when-not (str/blank? (:reseed opts)) (:reseed opts))
+                    last-send (cond goal [(str "/goal " goal) :goal-restored]
+                                    reseed [reseed :reseed])]
+                (when (or (nil? goal) (nil? reseed)
+                          (send-and-settle! h state ref pane-id reseed :reseed opts))
+                  (if-let [[text k] last-send]
+                    (when-let [{:keys [started? row]} (send-and-start! h state ref pane-id text k opts)]
+                      (swap! state assoc :status :done :started? started?
+                             :tokens-after (:ctx-tokens row) :goal-active-after? (:goal-active? row)))
+                    (let [end (observe h ref)]
+                      (swap! state assoc :status :done :tokens-after (:ctx-tokens end)
+                             :goal-active-after? (:goal-active? end)))))))))))
     @state))
 
 (defn- start-row
@@ -224,9 +249,9 @@
         (swap! state assoc :goal goal :captured captured)
         (if-not goal
           (fail! state :no-goal {:note "pass goal, or goal_append on a pane whose goal is active"})
-          (when (send-and-settle! h state ref (:pane ready) (str "/goal " goal) :goal-set opts)
-            (let [end (observe h ref)]
-              (swap! state assoc :status :done :goal-active-after? (:goal-active? end))))))))
+          (when-let [{:keys [started? row]} (send-and-start! h state ref (:pane ready) (str "/goal " goal) :goal-set opts)]
+            (swap! state assoc :status :done :started? started?
+                   :goal-active-after? (:goal-active? row)))))))
   @state)
 
 ;;; Boundary
