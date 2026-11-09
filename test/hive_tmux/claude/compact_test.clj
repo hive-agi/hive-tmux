@@ -1,0 +1,105 @@
+(ns hive-tmux.claude.compact-test
+  "The compaction sequence against a scripted host: a fake pane whose screen
+   reacts to what is typed into it. No tmux, no ~/.claude, no real clock."
+  (:require [clojure.data.json :as json]
+            [clojure.string :as str]
+            [clojure.test :refer [deftest is]]
+            [hive-tmux.claude.compact :as compact]
+            [hive-tmux.claude.panes :as panes]
+            [hive-tmux.claude.registry :as registry]
+            [hive-tmux.claude.host :as host]))
+
+(def goal-text "Work in a loop on funeraria: take card 0812fc24, then 2a255f97.")
+
+(defn- goal-line [args]
+  (json/write-str {:type "user"
+                   :message {:role "user"
+                             :content (str "<command-name>/goal</command-name>\n"
+                                           "<command-message>goal</command-message>\n"
+                                           "<command-args>" args "</command-args>")}}))
+
+(defn- screen [{:keys [tokens busy-polls goal?]}]
+  [(if (pos? busy-polls) "✶ Compacting… (12s · ↓ 1k tokens)" "✻ Worked for 2s")
+   (str "   " tokens " tokens" (when goal? " · ◎ /goal active (3m)"))
+   "──────────── peer one ─"
+   "❯ "
+   "  -- INSERT -- ⏵⏵ auto mode on"])
+
+(defn scripted-host
+  "A host whose single pane %9 runs \"peer one\". Each submitted line makes the
+   pane busy for two polls; /compact drops the tokens and clears the goal, and
+   /goal sets it again. :sent records every submitted line in order."
+  [{:keys [tokens goal? transcript]}]
+  (let [st (atom {:tokens tokens :busy-polls 0 :goal? goal? :clock 0
+                  :typed "" :sent [] :argv []})
+        submit! (fn [line]
+                  (swap! st (fn [s]
+                              (cond-> (-> s (update :sent conj line) (assoc :busy-polls 2 :typed ""))
+                                (str/starts-with? line "/compact") (assoc :tokens 30000 :goal? false)
+                                (str/starts-with? line "/goal ") (assoc :goal? true)
+                                (= line "hive workflow catchup /caveman") (update :tokens + 20000)))))]
+    {:state st
+     :host
+     {:tmux! (fn tmux!
+               ([argv] (tmux! argv nil))
+               ([argv _stdin]
+                (swap! st update :argv conj argv)
+                (case (first argv)
+                  "list-panes" {:exit 0 :out "%9\t1\t3\t1\t100\tclaude\t/srv/peer\t✳ peer one\n" :err ""}
+                  "capture-pane" (let [s @st]
+                                   (when (pos? (:busy-polls s)) (swap! st update :busy-polls dec))
+                                   {:exit 0 :out (str/join "\n" (screen s)) :err ""})
+                  "send-keys" (let [[_ _ _ & ks] argv]
+                                (cond (= ["Enter"] ks) (submit! (:typed @st))
+                                      (= "-l" (first ks)) (swap! st assoc :typed (second ks)))
+                                {:exit 0 :out "" :err ""})
+                  {:exit 0 :out "" :err ""})))
+      :sessions (fn [] [{:pid 200 :sessionId "sid-1" :name "peer one" :cwd "/srv/peer"
+                         :status (if (pos? (:busy-polls @st)) "busy" "idle") :updatedAt 1}])
+      :transcript (fn [cwd sid] (when (= ["/srv/peer" "sid-1"] [cwd sid]) transcript))
+      :sleep! (fn [ms] (swap! st update :clock + ms))
+      :now-ms (fn [] (:clock @st))}}))
+
+(def fast {:poll-ms 1000 :settle-ms 2000 :sync? true})
+
+(deftest compacts-reseeds-and-restores-the-goal
+  (let [{:keys [state host]} (scripted-host {:tokens 450000 :goal? true
+                                             :transcript ["{\"type\":\"x\"}" (goal-line goal-text)]})
+        job (compact/start! "peer one" (assoc fast :host host))]
+    (is (= :done (:status job)) (pr-str (dissoc job :steps)))
+    (is (= ["/compact" "hive workflow catchup /caveman" (str "/goal " goal-text)]
+           (:sent @state))
+        "the goal comes back AFTER the re-seed, because /compact cleared it")
+    (is (= 450000 (:tokens-before job)))
+    (is (= 50000 (:tokens-after job)))
+    (is (true? (:goal-active-after? job)))
+    (is (= goal-text (:goal job)))))
+
+(deftest under-threshold-is-skipped-unless-forced
+  (let [{:keys [state host]} (scripted-host {:tokens 100000 :goal? false})]
+    (is (= :skipped (:status (compact/start! "%9" (assoc fast :host host)))))
+    (is (empty? (:sent @state)))
+    (is (= :done (:status (compact/start! "%9" (assoc fast :host host :force? true)))))
+    (is (= ["/compact" "hive workflow catchup /caveman"] (:sent @state))
+        "no goal was active, so none is sent")))
+
+(deftest a-pane-that-never-settles-fails-instead-of-hanging
+  (let [{:keys [state host]} (scripted-host {:tokens 450000 :goal? false})]
+    (swap! state assoc :busy-polls 1000000)
+    (let [job (compact/start! "%9" (assoc fast :host host :idle-timeout-ms 20000))]
+      (is (= :failed (:status job)))
+      (is (= {:during :wait-idle} (:error job)))
+      (is (empty? (:sent @state)) "nothing is typed into a working pane"))))
+
+(deftest a-cleared-goal-is-not-restored
+  (is (nil? (panes/goal-text [(goal-line goal-text) (goal-line "clear")])))
+  (is (= goal-text (panes/goal-text [(goal-line "old") (goal-line goal-text)]))))
+
+(deftest sweep-dry-run-names-only-panes-over-threshold
+  (let [{:keys [state host]} (scripted-host {:tokens 450000 :goal? false})
+        h-params {:command "compact" :dry_run true}]
+    (binding [host/*host* host] (let [r (registry/dispatch h-params)]
+        (is (= ["%9"] (mapv :pane (get-in r [:ok :would-compact]))))
+        (is (empty? (get-in (registry/dispatch (assoc h-params :exclude "peer one")) [:ok :would-compact])))
+        (is (empty? (get-in (registry/dispatch (assoc h-params :threshold 500000)) [:ok :would-compact])))))
+    (is (empty? (:sent @state)) "a dry run types nothing")))
