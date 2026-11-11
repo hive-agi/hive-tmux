@@ -8,8 +8,10 @@
    can never touch the server an operator runs.
 
    Requires tmux and libtmux (conda hive env).
-   Run: clojure -M:test --focus-meta :e2e"
-  (:require [clojure.java.shell :as shell]
+   Run: clojure -M:test --config-file tests-e2e.edn"
+  (:require [clojure.java.io :as io]
+            [clojure.java.shell :as shell]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [hive-tmux.python.bridge :as py-bridge]
             [hive-tmux.python.tmux-ops :as tmux-ops]
@@ -28,7 +30,9 @@
         (f)
         (finally
           (tmux-ops/reset-server!)
-          (shell/sh "tmux" "-L" sock "kill-server"))))))
+          (let [path (str/trim (:out (shell/sh "tmux" "-L" sock "display-message" "-p" "#{socket_path}")))]
+            (shell/sh "tmux" "-L" sock "kill-server")
+            (when (str/ends-with? path sock) (io/delete-file path true))))))))
 
 (use-fixtures :each private-tmux)
 

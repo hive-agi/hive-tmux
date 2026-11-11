@@ -9,5 +9,5 @@
    ;; even a run that drops this skip cannot touch the operator's server.
    ;; Skipping by metadata keeps them visible as skipped in the count.
    ;; Run them deliberately:
-   ;;   clojure -M:test --focus-meta :e2e
+   ;;   clojure -M:test --config-file tests-e2e.edn
    :kaocha.filter/skip-meta [:e2e :integration]}]}

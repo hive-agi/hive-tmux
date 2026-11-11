@@ -1,0 +1,8 @@
+#kaocha/v1
+{:tests
+ [{:id :e2e
+   ;; Only the ^:e2e tests: a real tmux via libtmux, each on its own private
+   ;; server (`tmux -L hive-e2e-<uuid>`) that its fixture kills. Never the
+   ;; operator's default server. Run:
+   ;;   clojure -M:test --config-file tests-e2e.edn
+   :kaocha.filter/focus-meta [:e2e]}]}
