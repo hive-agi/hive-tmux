@@ -18,11 +18,11 @@
                                            "<command-message>goal</command-message>\n"
                                            "<command-args>" args "</command-args>")}}))
 
-(defn- screen [{:keys [tokens busy-polls goal? human]}]
+(defn- screen [{:keys [tokens busy-polls goal? human ghost]}]
   [(if (pos? busy-polls) "✶ Compacting… (12s · ↓ 1k tokens)" "✻ Worked for 2s")
    (str "   " tokens " tokens" (when goal? " · ◎ /goal active (3m)"))
    "──────────── peer one ─"
-   (str "❯ " human)
+   (str "\u001b[39m❯ " human (when ghost (str "\u001b[2m" ghost "\u001b[0m")))
    "  -- INSERT -- ⏵⏵ auto mode on"])
 
 (defn scripted-host
@@ -204,3 +204,36 @@
 (deftest an-unknown-kind-is-refused
   (let [{:keys [host]} (scripted-host {:tokens 1 :goal? false})]
     (is (= :unknown-kind (:error (compact/start! "%9" (assoc fast :host host :kind :dance)))))))
+
+(deftest a-dim-suggestion-at-the-prompt-does-not-stop-a-job
+  ;; Friction 20261110151501: compact cc-b1f601ea and say cc-39f40b72 were
+  ;; skipped as pending-human-input over Claude Code's ghost text.
+  (testing "say"
+    (let [{:keys [state host]} (scripted-host {:tokens 100000 :goal? false})]
+      (swap! state assoc :ghost "uncordoned, continue")
+      (let [job (compact/start! "%9" (assoc fast :host host :kind :say :text "hello"))]
+        (is (= :done (:status job)) (pr-str (dissoc job :steps)))
+        (is (= ["hello"] (:sent @state))))))
+  (testing "compact"
+    (let [{:keys [state host]} (scripted-host {:tokens 450000 :goal? true
+                                               :transcript [(goal-line goal-text)]})]
+      (swap! state assoc :ghost "ff and core-reload")
+      (let [job (compact/start! "%9" (assoc fast :host host))]
+        (is (= :done (:status job)) (pr-str (dissoc job :steps)))
+        (is (= "/compact" (first (:sent @state)))))))
+  (testing "typed text before a dim tail still stops it"
+    (let [{:keys [state host]} (scripted-host {:tokens 100000 :goal? false})]
+      (swap! state assoc :human "half" :ghost " a sentence")
+      (let [job (compact/start! "%9" (assoc fast :host host :kind :say :text "hello"))]
+        (is (= [:skipped :pending-human-input] [(:status job) (:reason job)]))
+        (is (= "half" (get-in job [:error :input])))
+        (is (empty? (:sent @state)))))))
+
+(deftest panes-label-dim-prompt-text-as-a-suggestion
+  (let [{:keys [state host]} (scripted-host {:tokens 100000 :goal? false})]
+    (swap! state assoc :ghost "hot-reload magit, plain git ok")
+    (let [row (panes/pane host "%9")]
+      (is (nil? (:input row)))
+      (is (= "hot-reload magit, plain git ok" (:suggestion row))))
+    (is (some #(and (= "capture-pane" (first %)) (some #{"-e"} %)) (:argv @state))
+        "the capture keeps escapes, else dim text cannot be told from typed text")))
