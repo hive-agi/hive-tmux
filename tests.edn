@@ -1,14 +1,13 @@
 #kaocha/v1
 {:tests
  [{:id :unit
-   ;; The ^:integration tests drive a REAL tmux server through libtmux, so they
-   ;; need a session and the conda hive env. Without those they take the
-   ;; (when (ensure-python!) ...) branch and assert nothing, which kaocha
-   ;; correctly reports as a FAILURE rather than a pass: a test that ran no
-   ;; assertions proved nothing.
+   ;; The default suite runs on stubs only: no test in it reaches a tmux
+   ;; server, ~/.claude or a clock (convention 20261111105238).
    ;;
-   ;; Skipping by metadata is the honest form. kaocha reports them as skipped,
-   ;; so the count says what was not run instead of hiding it inside a green
-   ;; total. Run them deliberately:
-   ;;   clojure -M:test --focus-meta :integration
-   :kaocha.filter/skip-meta [:integration]}]}
+   ;; ^:e2e tests drive a REAL tmux through libtmux. Each builds its own
+   ;; private server (`tmux -L hive-e2e-<uuid>`, killed by its fixture), so
+   ;; even a run that drops this skip cannot touch the operator's server.
+   ;; Skipping by metadata keeps them visible as skipped in the count.
+   ;; Run them deliberately:
+   ;;   clojure -M:test --focus-meta :e2e
+   :kaocha.filter/skip-meta [:e2e :integration]}]}

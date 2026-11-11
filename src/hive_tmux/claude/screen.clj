@@ -224,18 +224,53 @@
       (apply str (map first (sgr-runs s)))
       s)))
 
-(defn- prompt-split
-  "{:input typed :suggestion dim} of a prompt LINE (escapes kept), each the
-   text after `❯`, space-trimmed, nil when empty. Dim (SGR 2) text is Claude
-   Code's ghost suggestion; everything else was typed."
+(declare rule-line?)
+
+(def voice-marks
+  "What Claude Code 2.1.x draws under the prompt while voice dictation runs:
+   recording (hold or tap mode), push-to-talk held, transcribing. Its interim
+   transcript is drawn dim INSIDE the value the human is composing, so while
+   any of these shows, dim text at the prompt is the human's own words."
+  ["listening…" "keep holding…" "Voice: processing…" " REC"])
+
+(defn- after-glyph
+  "The [text dim?] runs of a prompt LINE (escapes kept) after `❯`."
   [line]
-  (let [after (loop [[[t d :as run] & more] (sgr-runs line)]
-                (cond (nil? run) nil
-                      (str/includes? t "❯") (let [i (str/index-of t "❯")]
-                                              (cons [(subs t (inc i)) d] more))
-                      :else (recur more)))
-        text (fn [want] (not-empty (utrim (apply str (keep (fn [[t d]] (when (= want d) t)) after)))))]
-    {:input (text false) :suggestion (text true)}))
+  (loop [[[t d :as run] & more] (sgr-runs line)]
+    (cond (nil? run) nil
+          (str/includes? t "❯") (cons [(subs t (inc (str/index-of t "❯"))) d] more)
+          :else (recur more))))
+
+(defn- prompt-split
+  "{:input :suggestion} of the prompt at index P; RAW keeps escapes, LINES are
+   the same lines stripped.
+
+   Dim (SGR 2) text is :suggestion only when it is PROVEN to be Claude Code's
+   ghost text, which needs all of:
+     * every visible character after `❯` is dim. Claude Code draws the ghost
+       only into an EMPTY value, so dim text beside typed text is part of what
+       the human is composing (a voice interim range);
+     * no voice mark (`voice-marks`) on any line under the prompt;
+     * the prompt box is whole on screen: no text between `❯` and the rule
+       that closes the box (a second input line), and a non-blank line after
+       that rule, where a voice mark would show.
+   Anything else is :input, every visible character in screen order (lines
+   joined by newline). Unproven dim text blocks a sender: the fail-safe side."
+  [raw lines p]
+  (let [runs (after-glyph (nth raw p))
+        visible (utrim (apply str (map first runs)))
+        below (subvec lines (inc p))
+        [box tail] (split-with (complement rule-line?) below)
+        closed? (boolean (seq tail))
+        more (when closed? (not-empty (str/join "\n" (remove str/blank? (map utrim box)))))
+        text (not-empty (str/join "\n" (remove str/blank? [visible more])))
+        all-dim? (every? (fn [[t d]] (or d (str/blank? (utrim t)))) runs)
+        voice? (some (fn [l] (some #(str/includes? l %) voice-marks)) below)
+        proven? (and (seq visible) all-dim? (nil? more) (not voice?)
+                     (some (complement str/blank?) (map utrim (rest tail))))]
+    (if proven?
+      {:input nil :suggestion visible}
+      {:input text :suggestion nil})))
 
 (defn read-screen
   "The facts of LINES, a pane capture top to bottom, escapes kept (`tmux
@@ -245,9 +280,11 @@
 
    :input is what stands after `❯` on the prompt line and was typed by
    someone; a sender must not type over it. :suggestion is the dimmed (SGR 2)
-   ghost text Claude Code predicts there: no one typed it, a sender may type
-   over it. A capture without escapes cannot tell them apart and reads all of
-   it as :input, the safe side.
+   ghost text Claude Code predicts there, only when `prompt-split` can PROVE
+   it is ghost text: no one typed it, a sender may type over it. Dim text it
+   cannot prove (a voice-dictation interim range, dim beside typed text, a
+   box cut off by the capture, a capture without escapes) reads as :input,
+   the safe side.
 
    :goal-ended? is true when no goal is active and the screen still shows
    Claude Code's `Goal achieved` line: the pane finished its goal and waits
@@ -259,7 +296,7 @@
       (let [above (subvec lines (max 0 (- p 12)) p)
             goal (last-some goal-of above)
             activity (last-some activity-of above)
-            {:keys [input suggestion]} (prompt-split (nth raw p))]
+            {:keys [input suggestion]} (prompt-split raw lines p)]
         {:claude? true
          :ctx-tokens (last-some ctx-tokens-of above)
          :busy? (boolean activity)

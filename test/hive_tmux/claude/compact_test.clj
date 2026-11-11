@@ -18,12 +18,13 @@
                                            "<command-message>goal</command-message>\n"
                                            "<command-args>" args "</command-args>")}}))
 
-(defn- screen [{:keys [tokens busy-polls goal? human ghost]}]
+(defn- screen [{:keys [tokens busy-polls goal? human ghost voice]}]
   [(if (pos? busy-polls) "✶ Compacting… (12s · ↓ 1k tokens)" "✻ Worked for 2s")
    (str "   " tokens " tokens" (when goal? " · ◎ /goal active (3m)"))
    "──────────── peer one ─"
    (str "\u001b[39m❯ " human (when ghost (str "\u001b[2m" ghost "\u001b[0m")))
-   "  -- INSERT -- ⏵⏵ auto mode on"])
+   "────────────"
+   (str "  -- INSERT -- ⏵⏵ auto mode on" (when voice " · listening…"))])
 
 (defn scripted-host
   "A host whose single pane %9 runs \"peer one\". Each submitted line makes the
@@ -226,8 +227,16 @@
       (swap! state assoc :human "half" :ghost " a sentence")
       (let [job (compact/start! "%9" (assoc fast :host host :kind :say :text "hello"))]
         (is (= [:skipped :pending-human-input] [(:status job) (:reason job)]))
-        (is (= "half" (get-in job [:error :input])))
-        (is (empty? (:sent @state)))))))
+        (is (= "half a sentence" (get-in job [:error :input])) "dim beside typed text is input too")
+        (is (empty? (:sent @state))))))
+  (testing "voice-dictation interim text (all dim) stops it while dictation shows (review F1)"
+    (let [{:keys [state host]} (scripted-host {:tokens 450000 :goal? false})]
+      (swap! state assoc :ghost "please stop the deploy" :voice true)
+      (doseq [opts [{:kind :say :text "hello"} {}]]
+        (let [job (compact/start! "%9" (merge fast {:host host} opts))]
+          (is (= [:skipped :pending-human-input] [(:status job) (:reason job)]) (pr-str opts))
+          (is (= "please stop the deploy" (get-in job [:error :input])))))
+      (is (empty? (:sent @state))))))
 
 (deftest panes-label-dim-prompt-text-as-a-suggestion
   (let [{:keys [state host]} (scripted-host {:tokens 100000 :goal? false})]

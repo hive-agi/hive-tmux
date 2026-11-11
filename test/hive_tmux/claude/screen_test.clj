@@ -132,10 +132,48 @@
     (is (nil? (:suggestion s)))
     (is (false? (:busy? s)) "`Churned for 25m 22s` is a finished turn")))
 
-(deftest typed-text-before-a-dim-tail-is-input
+(deftest dim-text-beside-typed-text-is-input
+  ;; Claude Code draws its ghost only into an empty value, so a dim tail after
+  ;; typed text is part of what the human composes (review F1, F4).
   (let [s (screen/read-screen (fixture "typed-then-suggestion"))]
-    (is (= "hotfix" (:input s)) "only the bright run was typed")
-    (is (= "-reload magit, plain git ok" (:suggestion s)))))
+    (is (= "hotfix-reload magit, plain git ok" (:input s)) "all of it, in screen order")
+    (is (nil? (:suggestion s)))))
+
+(deftest a-real-ghost-capture-is-a-suggestion
+  ;; Live `capture-pane -e` of pane %3 (unfocused), 2026-11-11, prompt block only.
+  (let [s (screen/read-screen (fixture "real-ghost-unfocused"))]
+    (is (nil? (:input s)))
+    (is (= "sync sisf-db-staging yourself, I allow it" (:suggestion s)))
+    (is (= 197333 (:ctx-tokens s)))))
+
+(deftest voice-dictation-interim-text-is-the-humans-input
+  ;; Review F1: Claude Code 2.1.322 draws the voice interim range dimColor
+  ;; inside the value, and `listening…` under the prompt while recording.
+  (let [s (screen/read-screen (fixture "voice-interim"))]
+    (is (= "please stop the deploy" (:input s)))
+    (is (nil? (:suggestion s))))
+  (doseq [mark screen/voice-marks]
+    (is (some? (:input (screen/read-screen (assoc (fixture "real-ghost-unfocused") 4 (str "  " mark)))))
+        mark)))
+
+(def ^:private dim-prompt "\u001b[39m❯\u00a0\u001b[2mghost words\u001b[0m")
+(def ^:private rule "────────────")
+
+(deftest dim-text-is-a-suggestion-only-when-the-box-is-whole
+  (testing "the proven shape"
+    (is (= "ghost words" (:suggestion (screen/read-screen [rule dim-prompt rule "  -- INSERT --"])))))
+  (testing "no closing rule in the capture"
+    (is (= "ghost words" (:input (screen/read-screen [rule dim-prompt])))))
+  (testing "nothing under the closing rule, where a voice mark would show"
+    (is (= "ghost words" (:input (screen/read-screen [rule dim-prompt rule])))))
+  (testing "a second input line inside the box (review F5)"
+    (is (= "ghost words\nline two" (:input (screen/read-screen [rule dim-prompt "  line two" rule "  x"]))))
+    (is (= "line two" (:input (screen/read-screen [rule "❯\u00a0" "  line two" rule "  x"])))
+        "an empty first line does not hide a typed second line"))
+  (testing "a capture without escapes"
+    (is (= "ghost words" (:input (screen/read-screen [rule "❯ ghost words" rule "  x"])))))
+  (testing "an idle prompt has neither"
+    (is (= [nil nil] ((juxt :input :suggestion) (screen/read-screen [rule "❯\u00a0" rule "  x"]))))))
 
 (deftest sgr-parsing
   (testing "dim is set by 2 alone or inside a compound, cleared by 0, 22 or a bare m"
