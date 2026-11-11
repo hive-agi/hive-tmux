@@ -28,7 +28,10 @@
 
 (def Screen
   "What one pane's screen says. A fact is nil when the screen does not say it,
-   which is different from false: an unreadable pane is not an idle one."
+   which is different from false: an unreadable pane is not an idle one.
+
+   :input is text someone typed at the prompt; :suggestion is the dimmed
+   (SGR 2) ghost text Claude Code predicts there, which no one typed."
   [:map
    [:claude? :boolean]
    [:ctx-tokens [:maybe nat-int?]]
@@ -39,7 +42,8 @@
    [:footer-name [:maybe :string]]
    [:vim-mode [:maybe [:enum :insert :normal]]]
    [:activity [:maybe :string]]
-   [:input [:maybe :string]]])
+   [:input [:maybe :string]]
+   [:suggestion [:maybe :string]]])
 
 (def ^:private segment-sep " · ")
 (def ^:private goal-mark "◎ /goal active")
@@ -119,7 +123,7 @@
         :else nil))
 
 (def ^:private unread
-  {:claude? false :ctx-tokens nil :busy? nil :goal-active? false :goal-age nil :footer-name nil :vim-mode nil :activity nil :input nil})
+  {:claude? false :ctx-tokens nil :busy? nil :goal-active? false :goal-age nil :footer-name nil :vim-mode nil :activity nil :input nil :suggestion nil})
 
 (defn- space? [c]
   (or (Character/isWhitespace ^char c) (Character/isSpaceChar ^char c)))
@@ -134,25 +138,165 @@
         e (- (count s) (count (take-while space? (reverse s))))]
     (if (< b e) (subs s b e) "")))
 
-(defn read-screen
-  "The facts of LINES, a pane capture top to bottom. A screen with no prompt
-   is `:claude? false` with every fact nil: not a Claude Code pane, or one
-   mid-redraw, and either way nothing on it can be trusted.
+;;; Escapes. Lines come from `tmux capture-pane -e`, which keeps SGR runs:
+;;; the only way to tell Claude Code's dimmed prompt suggestion from text a
+;;; human typed is that the suggestion is drawn in SGR 2 (faint).
 
-   :input is whatever stands after `❯` on the prompt line. Text there was
-   typed by someone (or is a dimmed suggestion, which a plain capture cannot
-   tell apart); a sender must not type over it.
+(def ^:private esc \u001b)
+
+(defn- split-semi
+  "S split at every `;`, keeping empty fields."
+  [s]
+  (loop [acc [] from 0]
+    (if-let [i (str/index-of s ";" from)]
+      (recur (conj acc (subs s from i)) (inc i))
+      (conj acc (subs s from)))))
+
+(defn- sgr-dim
+  "DIM after applying the SGR parameter string PARAMS (`38;5;246;2`): 2 sets
+   faint, 0 (or an empty list) and 22 clear it; the operands of an extended
+   colour (38/48/58 ;5;n and ;2;r;g;b) are skipped, so the 2 of `38;5;2` is a
+   colour, not faint."
+  [dim params]
+  (loop [ps (if (str/blank? params) ["0"] (split-semi params)) dim dim]
+    (if-let [[p & more] (seq ps)]
+      (case p
+        ("" "0" "22") (recur more false)
+        "2" (recur more true)
+        ("38" "48" "58") (case (first more)
+                           "5" (recur (drop 2 more) dim)
+                           "2" (recur (drop 4 more) dim)
+                           (recur more dim))
+        (recur more dim))
+      dim)))
+
+(defn- skip-escape
+  "Index just past the escape sequence starting at I in S, and its SGR params
+   when it is an SGR (`ESC [ ... m`), as [end params-or-nil]. CSI, OSC (ended
+   by BEL or ESC \\) and two-byte escapes are all consumed."
+  [^String s i]
+  (let [n (count s)
+        nxt (when (< (inc i) n) (.charAt s (inc i)))]
+    (case nxt
+      \[ (let [end (loop [j (+ i 2)]
+                     (cond (>= j n) n
+                           (<= 0x40 (int (.charAt s j)) 0x7e) j
+                           :else (recur (inc j))))]
+           (if (< end n)
+             [(inc end) (when (= \m (.charAt s end)) (subs s (+ i 2) end))]
+             [n nil]))
+      \] (loop [j (+ i 2)]
+           (cond (>= j n) [n nil]
+                 (= \u0007 (.charAt s j)) [(inc j) nil]
+                 (and (= esc (.charAt s j)) (< (inc j) n) (= \\ (.charAt s (inc j)))) [(+ j 2) nil]
+                 :else (recur (inc j))))
+      nil [n nil]
+      [(+ i 2) nil])))
+
+(defn sgr-runs
+  "LINE as [[text dim?] ...]: the visible text in order, split where SGR
+   faint turns on or off, escapes removed. Adjacent runs never share dim?."
+  [line]
+  (let [s (str line) n (count s)]
+    (loop [i 0 dim false buf (StringBuilder.) runs []]
+      (let [flush (fn [runs] (if (pos? (.length buf))
+                               (let [t (str buf)]
+                                 (.setLength buf 0)
+                                 (if (= dim (second (peek runs)))
+                                   (conj (pop runs) [(str (first (peek runs)) t) dim])
+                                   (conj runs [t dim])))
+                               runs))]
+        (cond
+          (>= i n) (flush runs)
+          (= esc (.charAt s i))
+          (let [[end params] (skip-escape s i)
+                dim' (if params (sgr-dim dim params) dim)]
+            (if (= dim dim')
+              (recur end dim buf runs)
+              (let [runs (flush runs)] (recur end dim' buf runs))))
+          :else (do (.append buf (.charAt s i)) (recur (inc i) dim buf runs)))))))
+
+(defn strip-ansi
+  "LINE without escape sequences."
+  [line]
+  (let [s (str line)]
+    (if (str/includes? s (str esc))
+      (apply str (map first (sgr-runs s)))
+      s)))
+
+(declare rule-line?)
+
+(def voice-marks
+  "What Claude Code 2.1.x draws under the prompt while voice dictation runs:
+   recording (hold or tap mode), push-to-talk held, transcribing. Its interim
+   transcript is drawn dim INSIDE the value the human is composing, so while
+   any of these shows, dim text at the prompt is the human's own words."
+  ["listening…" "keep holding…" "Voice: processing…" " REC"])
+
+(defn- after-glyph
+  "The [text dim?] runs of a prompt LINE (escapes kept) after `❯`."
+  [line]
+  (loop [[[t d :as run] & more] (sgr-runs line)]
+    (cond (nil? run) nil
+          (str/includes? t "❯") (cons [(subs t (inc (str/index-of t "❯"))) d] more)
+          :else (recur more))))
+
+(defn- prompt-split
+  "{:input :suggestion} of the prompt at index P; RAW keeps escapes, LINES are
+   the same lines stripped.
+
+   Dim (SGR 2) text is :suggestion only when it is PROVEN to be Claude Code's
+   ghost text, which needs all of:
+     * every visible character after `❯` is dim. Claude Code draws the ghost
+       only into an EMPTY value, so dim text beside typed text is part of what
+       the human is composing (a voice interim range);
+     * no voice mark (`voice-marks`) on any line under the prompt;
+     * the prompt box is whole on screen: no text between `❯` and the rule
+       that closes the box (a second input line), and a non-blank line after
+       that rule, where a voice mark would show.
+   Anything else is :input, every visible character in screen order (lines
+   joined by newline). Unproven dim text blocks a sender: the fail-safe side."
+  [raw lines p]
+  (let [runs (after-glyph (nth raw p))
+        visible (utrim (apply str (map first runs)))
+        below (subvec lines (inc p))
+        [box tail] (split-with (complement rule-line?) below)
+        closed? (boolean (seq tail))
+        more (when closed? (not-empty (str/join "\n" (remove str/blank? (map utrim box)))))
+        text (not-empty (str/join "\n" (remove str/blank? [visible more])))
+        all-dim? (every? (fn [[t d]] (or d (str/blank? (utrim t)))) runs)
+        voice? (some (fn [l] (some #(str/includes? l %) voice-marks)) below)
+        proven? (and (seq visible) all-dim? (nil? more) (not voice?)
+                     (some (complement str/blank?) (map utrim (rest tail))))]
+    (if proven?
+      {:input nil :suggestion visible}
+      {:input text :suggestion nil})))
+
+(defn read-screen
+  "The facts of LINES, a pane capture top to bottom, escapes kept (`tmux
+   capture-pane -e`) or not. A screen with no prompt is `:claude? false` with
+   every fact nil: not a Claude Code pane, or one mid-redraw, and either way
+   nothing on it can be trusted.
+
+   :input is what stands after `❯` on the prompt line and was typed by
+   someone; a sender must not type over it. :suggestion is the dimmed (SGR 2)
+   ghost text Claude Code predicts there, only when `prompt-split` can PROVE
+   it is ghost text: no one typed it, a sender may type over it. Dim text it
+   cannot prove (a voice-dictation interim range, dim beside typed text, a
+   box cut off by the capture, a capture without escapes) reads as :input,
+   the safe side.
 
    :goal-ended? is true when no goal is active and the screen still shows
    Claude Code's `Goal achieved` line: the pane finished its goal and waits
    for new work."
   [lines]
-  (let [lines (vec lines)]
+  (let [raw (vec lines)
+        lines (mapv strip-ansi raw)]
     (if-let [p (prompt-index lines)]
       (let [above (subvec lines (max 0 (- p 12)) p)
             goal (last-some goal-of above)
             activity (last-some activity-of above)
-            prompt-line (str/triml (nth lines p))]
+            {:keys [input suggestion]} (prompt-split raw lines p)]
         {:claude? true
          :ctx-tokens (last-some ctx-tokens-of above)
          :busy? (boolean activity)
@@ -162,7 +306,8 @@
          :footer-name (last-some footer-name-of above)
          :vim-mode (vim-mode (subvec lines p))
          :activity activity
-         :input (not-empty (utrim (subs prompt-line 1)))})
+         :input input
+         :suggestion suggestion})
       unread)))
 
 (m/=> read-screen [:=> [:cat [:sequential :string]] Screen])
@@ -204,9 +349,9 @@
    tip, footer rule), trailing blank lines dropped, at most N lines from the
    bottom. A screen with no prompt is returned whole, last N lines. No-break
    spaces, which Claude Code draws inside its chrome (`⎿` + U+00A0 + `Tip:`),
-   read as plain spaces."
+   read as plain spaces, and escapes (a `capture-pane -e` capture) are removed."
   [lines n]
-  (let [lines (mapv #(str/replace (str %) " " " ") lines)
+  (let [lines (mapv #(str/replace (strip-ansi %) "\u00a0" " ") lines)
         above (if-let [p (prompt-index lines)] (subvec lines 0 p) lines)
         kept (->> (rseq above) (drop-while chrome?) reverse vec)]
     (vec (take-last n kept))))

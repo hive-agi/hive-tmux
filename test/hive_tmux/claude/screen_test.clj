@@ -1,7 +1,8 @@
 (ns hive-tmux.claude.screen-test
   (:require [clojure.test :refer [deftest is testing]]
             [hive-tmux.claude.screen :as screen]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [clojure.java.io :as io]))
 
 (def busy-screen
   ["● hive - swarm (MCP)(command: \"ss wait\", parent: \"coordinator:70283\", timeout_ms: 100000)"
@@ -106,3 +107,84 @@
   (is (= ["✻ Worked for nothing, a sentence"]
          (screen/body ["✻ Worked for nothing, a sentence" "❯ "] 10))
       "only a duration after `for` makes it chrome"))
+
+;; Fixtures are `tmux capture-pane -e -p` of a live Claude Code 2.1.x pane
+;; (%0, 2026-11-11), escapes kept. ghost-suggestion and typed-then-suggestion
+;; replace only the prompt line with the shapes friction 20261110151501 saw:
+;; `❯ ESC[2mff and core-reload ESC[0m` on %9, typed text followed by a dim tail.
+(defn- fixture [name]
+  (str/split-lines (slurp (io/resource (str "hive_tmux/claude/fixtures/" name ".ansi")))))
+
+(deftest a-dim-suggestion-is-not-pending-input
+  (let [s (screen/read-screen (fixture "ghost-suggestion"))]
+    (is (:claude? s))
+    (is (nil? (:input s)) "SGR-2 ghost text was typed by no one")
+    (is (= "ff and core-reload" (:suggestion s)))
+    (is (= 295483 (:ctx-tokens s)) "facts above the prompt still read through the escapes")
+    (is (true? (:goal-active? s)))
+    (is (= "caveman mode sync" (:footer-name s)))
+    (is (= :insert (:vim-mode s)))))
+
+(deftest an-idle-captured-prompt-has-neither-input-nor-suggestion
+  (let [s (screen/read-screen (fixture "idle-prompt"))]
+    (is (:claude? s))
+    (is (nil? (:input s)))
+    (is (nil? (:suggestion s)))
+    (is (false? (:busy? s)) "`Churned for 25m 22s` is a finished turn")))
+
+(deftest dim-text-beside-typed-text-is-input
+  ;; Claude Code draws its ghost only into an empty value, so a dim tail after
+  ;; typed text is part of what the human composes (review F1, F4).
+  (let [s (screen/read-screen (fixture "typed-then-suggestion"))]
+    (is (= "hotfix-reload magit, plain git ok" (:input s)) "all of it, in screen order")
+    (is (nil? (:suggestion s)))))
+
+(deftest a-real-ghost-capture-is-a-suggestion
+  ;; Live `capture-pane -e` of pane %3 (unfocused), 2026-11-11, prompt block only.
+  (let [s (screen/read-screen (fixture "real-ghost-unfocused"))]
+    (is (nil? (:input s)))
+    (is (= "sync sisf-db-staging yourself, I allow it" (:suggestion s)))
+    (is (= 197333 (:ctx-tokens s)))))
+
+(deftest voice-dictation-interim-text-is-the-humans-input
+  ;; Review F1: Claude Code 2.1.322 draws the voice interim range dimColor
+  ;; inside the value, and `listening…` under the prompt while recording.
+  (let [s (screen/read-screen (fixture "voice-interim"))]
+    (is (= "please stop the deploy" (:input s)))
+    (is (nil? (:suggestion s))))
+  (doseq [mark screen/voice-marks]
+    (is (some? (:input (screen/read-screen (assoc (fixture "real-ghost-unfocused") 4 (str "  " mark)))))
+        mark)))
+
+(def ^:private dim-prompt "\u001b[39m❯\u00a0\u001b[2mghost words\u001b[0m")
+(def ^:private rule "────────────")
+
+(deftest dim-text-is-a-suggestion-only-when-the-box-is-whole
+  (testing "the proven shape"
+    (is (= "ghost words" (:suggestion (screen/read-screen [rule dim-prompt rule "  -- INSERT --"])))))
+  (testing "no closing rule in the capture"
+    (is (= "ghost words" (:input (screen/read-screen [rule dim-prompt])))))
+  (testing "nothing under the closing rule, where a voice mark would show"
+    (is (= "ghost words" (:input (screen/read-screen [rule dim-prompt rule])))))
+  (testing "a second input line inside the box (review F5)"
+    (is (= "ghost words\nline two" (:input (screen/read-screen [rule dim-prompt "  line two" rule "  x"]))))
+    (is (= "line two" (:input (screen/read-screen [rule "❯\u00a0" "  line two" rule "  x"])))
+        "an empty first line does not hide a typed second line"))
+  (testing "a capture without escapes"
+    (is (= "ghost words" (:input (screen/read-screen [rule "❯ ghost words" rule "  x"])))))
+  (testing "an idle prompt has neither"
+    (is (= [nil nil] ((juxt :input :suggestion) (screen/read-screen [rule "❯\u00a0" rule "  x"]))))))
+
+(deftest sgr-parsing
+  (testing "dim is set by 2 alone or inside a compound, cleared by 0, 22 or a bare m"
+    (is (= [["a" false] ["b" true] ["c" false]]
+           (screen/sgr-runs "a\u001b[2mb\u001b[0mc")))
+    (is (= [["b" true] ["c" false]]
+           (screen/sgr-runs "\u001b[38;5;246;2mb\u001b[22mc")))
+    (is (= [["b" true] ["c" false]]
+           (screen/sgr-runs "\u001b[2mb\u001b[mc")))
+    (is (= [["x" false]] (screen/sgr-runs "\u001b[38;5;2mx"))
+        "a 2 that is the colour index of 38;5;2 is not dim"))
+  (testing "strip-ansi leaves plain text"
+    (is (= "❯ ff" (screen/strip-ansi "\u001b[39m❯ \u001b[2mff\u001b[0m")))
+    (is (= "plain" (screen/strip-ansi "plain")))))
