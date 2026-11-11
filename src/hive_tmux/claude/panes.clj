@@ -130,7 +130,8 @@
              :goal-age (:goal-age facts)
              :activity (:activity facts)
              :vim-mode (:vim-mode facts)
-             :input (:input facts)}
+             :input (:input facts)
+             :suggestion (:suggestion facts)}
       ambiguous? (assoc :ambiguous? true)
       (nil? session) (assoc :unjoined? true))))
 
@@ -146,9 +147,12 @@
                       {:type :tmux/list-failed :exit exit})))))
 
 (defn capture
-  "The last LINES screen lines of PANE-ID, trailing blanks trimmed."
+  "The last LINES screen lines of PANE-ID, trailing blanks trimmed. Escapes are
+   kept (`-e`): the dimmed prompt suggestion differs from typed text only by
+   its SGR 2, so `screen/read-screen` needs them. Strip with
+   `screen/strip-ansi` before showing a line."
   [{:keys [tmux!]} pane-id lines]
-  (let [{:keys [exit out]} (tmux! ["capture-pane" "-p" "-t" pane-id "-S" (str (- lines))])]
+  (let [{:keys [exit out]} (tmux! ["capture-pane" "-p" "-e" "-t" pane-id "-S" (str (- lines))])]
     (when (zero? exit)
       (mapv str/trimr (split-on (str out) "\n")))))
 

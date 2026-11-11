@@ -22,23 +22,32 @@
 
 (def ^:private default-session-name "hive")
 
+(def ^:dynamic *socket-name*
+  "tmux -L socket name every operation here targets; nil is the default
+   server. e2e tests bind a private one, so they can never reach the server
+   an operator runs."
+  nil)
+
 (defn ensure-server!
-  "Connect to the running tmux server. Cached singleton.
+  "Connect to the tmux server `*socket-name*` names. Cached per socket name.
    Returns the libtmux Server object or throws with actionable message."
   []
-  (or @tmux-server
+  (or (get @tmux-server *socket-name*)
       (let [libtmux (py/py-import "libtmux")]
         (when-not libtmux
           (throw (ex-info (str "Cannot import libtmux Python package.\n"
                                "Fix: conda activate hive && pip install libtmux")
                           {:status :no-libtmux})))
-        (let [server (guard Exception nil (py/py-call libtmux "Server"))]
+        (let [server (guard Exception nil
+                            (if *socket-name*
+                              (py/py-call libtmux "Server" :socket_name *socket-name*)
+                              (py/py-call libtmux "Server")))]
           (when-not server
             (throw (ex-info
                     (str "Cannot connect to tmux server — is tmux running?\n"
                          "Fix: tmux new-session -d -s hive")
                     {:status :no-tmux-server})))
-          (reset! tmux-server server)
+          (swap! tmux-server assoc *socket-name* server)
           (log/info "[tmux-ops] Connected to tmux server")
           server))))
 
@@ -80,7 +89,8 @@
              (do (log/info "[tmux-ops] Created tmux session via libtmux" {:name session-name})
                  session)
              ;; Fallback: shell command (works in non-TTY contexts)
-             (do (let [{:keys [exit err]} (shell/sh "tmux" "new-session" "-d" "-s" session-name)]
+             (do (let [{:keys [exit err]} (apply shell/sh (concat ["tmux"] (when *socket-name* ["-L" *socket-name*])
+                                                                   ["new-session" "-d" "-s" session-name]))]
                    (when-not (zero? exit)
                      (throw (ex-info (str "Failed to create tmux session via shell: " err)
                                      {:session-name session-name :exit exit}))))

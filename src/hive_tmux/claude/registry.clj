@@ -156,7 +156,7 @@
                        :goal-active? (:goal-active? row) :goal-ended? (:goal-ended? row)
                        :screen (if (bool (:strip_chrome params) true)
                                  (screen/body lines n)
-                                 (vec (take-last n lines)))}
+                                 (mapv screen/strip-ansi (take-last n lines)))}
                 (and transcript (bool (:last_assistant params) true))
                 (assoc :last-assistant (panes/last-assistant-text transcript))))))))
 
@@ -175,7 +175,7 @@
 
 (def subcommands
   {"panes"   {:fn panes-cmd
-              :doc "Every Claude Code pane as data: pane, target, name, session-id, cwd, ctx-tokens, busy?, status, goal-active?, goal-age, activity. include_goal=true adds the /goal text."
+              :doc "Every Claude Code pane as data: pane, target, name, session-id, cwd, ctx-tokens, busy?, status, goal-active?, goal-age, activity, input (text typed at the prompt) and suggestion (Claude Code's dimmed ghost text there, typed by no one; never relay it as the owner's words). include_goal=true adds the /goal text."
               :params [:include_goal :socket_name]}
    "compact" {:fn compact-cmd
               :doc "Wait idle, capture the /goal, send /compact, re-seed (default \"hive workflow catchup /caveman\"), restore the goal. pane=<ref,...> compacts those panes whatever their size; no pane = every pane over threshold (default 400000) minus exclude. Background job; returns job ids."
