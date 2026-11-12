@@ -3,7 +3,7 @@
    for a supervisor, and compaction with re-seed and goal restore.
 
      swarm tmux panes     every Claude pane: pane, target, name, session id, cwd,
-                          ctx-tokens, busy?, status, goal-active?, goal-age
+                          project, ctx-tokens, busy?, status, goal-active?, goal-age
      swarm tmux compact   compact one pane, or every pane over threshold
      swarm tmux job       one compaction job by id, or all of them"
   (:require [clojure.pprint :as pp]
@@ -175,7 +175,7 @@
 
 (def subcommands
   {"panes"   {:fn panes-cmd
-              :doc "Every Claude Code pane as data: pane, target, name, session-id, cwd, ctx-tokens, busy?, status, goal-active?, goal-age, activity, input (text typed at the prompt) and suggestion (Claude Code's dimmed ghost text there, typed by no one; never relay it as the owner's words). include_goal=true adds the /goal text."
+              :doc "Every Claude Code pane as data: pane, target, name, session-id, cwd, project, ctx-tokens, busy?, status, goal-active?, goal-age, activity, input (text typed at the prompt) and suggestion (Claude Code's dimmed ghost text there, typed by no one; never relay it as the owner's words). include_goal=true adds the /goal text."
               :params [:include_goal :socket_name]}
    "compact" {:fn compact-cmd
               :doc "Wait idle, capture the /goal, send /compact, re-seed (default \"hive workflow catchup /caveman\"), restore the goal. pane=<ref,...> compacts those panes whatever their size; no pane = every pane over threshold (default 400000) minus exclude. Background job; returns job ids."

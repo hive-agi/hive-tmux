@@ -25,9 +25,11 @@
      :sessions     () -> [session-map ...]  (sessions/<pid>.json, parsed, keys keywordized)
      :transcript   (cwd session-id) -> [line ...] or nil
      :sleep!       (ms) -> nil
-     :now-ms       () -> epoch ms"
+     :now-ms       () -> epoch ms
+     :project-of   (cwd) -> hive project id or nil (optional)"
   [:map
-   [:tmux! fn?] [:sessions fn?] [:transcript fn?] [:sleep! fn?] [:now-ms fn?]])
+   [:tmux! fn?] [:sessions fn?] [:transcript fn?] [:sleep! fn?] [:now-ms fn?]
+   [:project-of {:optional true} fn?]])
 
 (defn claude-home
   "The Claude Code state directory: $CLAUDE_CONFIG_DIR, else user.home/.claude."
@@ -40,6 +42,22 @@
    or digit becomes `-` (\"/srv/a.b\" -> \"-srv-a-b\")."
   [cwd]
   (apply str (map #(if (Character/isLetterOrDigit ^char %) % \-) (str cwd))))
+
+(def project-id-sym
+  "The resolver pane senses get their project from (hive-mcp resolves a
+   shout's :directory with it)."
+  'hive-mcp.tools.memory.scope/get-current-project-id)
+
+(defn project-of
+  "The hive project id of directory CWD, resolved by RESOLVE (a fn of cwd;
+   default: `project-id-sym` resolved softly), or nil when CWD is blank, no
+   resolver is loaded, it throws, or it answers \"global\" (no project)."
+  ([cwd] (project-of (guard Throwable nil (requiring-resolve project-id-sym)) cwd))
+  ([resolve cwd]
+   (when (and resolve (not (str/blank? (str cwd))))
+     (let [id (guard Throwable nil (resolve cwd))]
+       (when (and (string? id) (not (str/blank? id)) (not= "global" id))
+         id)))))
 
 (defn- read-json [f]
   (guard Exception nil (json/read-str (slurp f) :key-fn keyword)))
@@ -76,7 +94,8 @@
                         (with-open [r (io/reader f)]
                           (vec (line-seq r))))))
       :sleep! (fn [ms] (Thread/sleep (long ms)))
-      :now-ms (fn [] (System/currentTimeMillis))})))
+      :now-ms (fn [] (System/currentTimeMillis))
+      :project-of (fn [cwd] (project-of cwd))})))
 
 (def ^:dynamic *host*
   "The port the verbs use when the caller passes none. Read at call time, so a

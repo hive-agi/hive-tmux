@@ -167,17 +167,20 @@
 ;;; Boundary
 
 (defn panes
-  "Every Claude Code pane as a row. OPTS:
+  "Every Claude Code pane as a row, with :project (the hive project id of its
+   cwd, via the host's :project-of; absent when unknown). OPTS:
      :include-goal?  also read each goal-active pane's transcript for :goal
      :lines          screen lines to read (default 40)"
   ([] (panes (host/host) {}))
   ([h] (panes h {}))
   ([h {:keys [include-goal? lines] :or {lines 40}}]
-   (let [sessions ((:sessions h))]
+   (let [sessions   ((:sessions h))
+         project-of (memoize (fn [cwd] (when-let [f (:project-of h)] (f cwd))))]
      (->> (list-raw h)
           (filter claude-pane?)
           (mapv (fn [p]
-                  (let [row (pane-row p (screen/read-screen (or (capture h (:pane p) lines) [])) sessions)]
+                  (let [row  (pane-row p (screen/read-screen (or (capture h (:pane p) lines) [])) sessions)
+                        row  (if-let [proj (project-of (:cwd row))] (assoc row :project proj) row)]
                     (if (and include-goal? (:goal-active? row) (:session-id row))
                       (assoc row :goal (goal-text (or ((:transcript h) (:cwd row) (:session-id row)) [])))
                       row))))))))
