@@ -140,35 +140,45 @@
 ;;; Remediation Hints (exhaustive via adt-case)
 ;;; =============================================================================
 
+(def ^:private optional-note
+  "Appended to every failing hint: tmux support is optional, so a customer
+   reading a boot log must not take a missing piece for a broken install."
+  "\n  (tmux support is optional; hive-mcp runs without it.)")
+
 (defn remediation-hint
   "Get user-facing remediation message for a preflight status ADT value.
-   Exhaustive matching — compile-time safety via adt-case."
+   Exhaustive matching — compile-time safety via adt-case.
+
+   Hints are read by a customer on a fresh machine: they name commands that
+   work there (no developer conda env) and say tmux support is optional."
   [status]
-  (adt-case PreflightStatus status
-            :preflight/available     nil
-            :preflight/no-libpython
-            "libpython-clj2 not on classpath. Add to deps.edn:
+  (some-> (adt-case PreflightStatus status
+                    :preflight/available     nil
+                    :preflight/no-libpython
+                    "libpython-clj2 not on classpath. Add to deps.edn:
   clj-python/libpython-clj {:mvn/version \"2.026\"}"
 
-            :preflight/no-python-exe
-            "Python executable not found. Install conda 'hive' env:
-  conda create -n hive python=3.11 && conda activate hive"
+                    :preflight/no-python-exe
+                    "Python executable not found. Install Python 3.10+ and put it on PATH:
+  sudo apt install python3 python3-pip    # Debian/Ubuntu
+  brew install python                     # macOS"
 
-            :preflight/python-init-fail
-            "libpython-clj failed to initialize Python. Check:
-  1. conda activate hive
-  2. python --version  (should be 3.10+)
-  3. Verify no conflicting Python env vars (PYTHONHOME, PYTHONPATH)"
+                    :preflight/python-init-fail
+                    "libpython-clj failed to initialize Python. Check:
+  1. python3 --version  (should be 3.10+)
+  2. the shared libpython is installed (Debian/Ubuntu: sudo apt install libpython3-dev)
+  3. no conflicting Python env vars (PYTHONHOME, PYTHONPATH)"
 
-            :preflight/no-libtmux
-            "libtmux Python package not installed. Install it:
-  conda activate hive && pip install libtmux"
+                    :preflight/no-libtmux
+                    "libtmux Python package not installed. Install it:
+  pip install --user libtmux"
 
-            :preflight/no-tmux-binary
-            "tmux binary not found on PATH. Install it:
+                    :preflight/no-tmux-binary
+                    "tmux binary not found on PATH. Install it:
   sudo apt install tmux    # Debian/Ubuntu
   sudo dnf install tmux    # Fedora
-  brew install tmux        # macOS"))
+  brew install tmux        # macOS")
+          (str optional-note)))
 
 ;;; =============================================================================
 ;;; Preflight Pipeline
