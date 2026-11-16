@@ -12,7 +12,8 @@
             [hive-dsl.adt :refer [defadt adt-case]]
             [hive-dsl.result :refer [rescue guard try-effect*]]
             [hive-tmux.config :as config]
-            [taoensso.timbre :as log]))
+            [taoensso.timbre :as log]
+            [clojure.string :as str]))
 
 ;; Copyright (C) 2026 Pedro Gomes Branquinho (BuddhiLW) <pedrogbranquinho@gmail.com>
 ;;
@@ -145,6 +146,22 @@
    reading a boot log must not take a missing piece for a broken install."
   "\n  (tmux support is optional; hive-mcp runs without it.)")
 
+(defn- on-path-python
+  "First executable `python3`/`python` on `path`, or nil.
+
+   The preflight below stats one hard-coded location; a customer whose
+   interpreter lives anywhere else (pyenv, homebrew, a venv put first) is
+   told their Python is missing when it is merely not in /usr/bin."
+  [path]
+  (let [names ["python3" "python"]]
+    (some (fn [dir]
+            (when-not (str/blank? dir)
+              (some (fn [n]
+                      (let [f (java.io.File. ^String dir ^String n)]
+                        (when (.canExecute f) (.getAbsolutePath f))))
+                    names)))
+          (str/split (or path "") #":"))))
+
 (defn remediation-hint
   "Get user-facing remediation message for a preflight status ADT value.
    Exhaustive matching — compile-time safety via adt-case.
@@ -159,7 +176,8 @@
   clj-python/libpython-clj {:mvn/version \"2.026\"}"
 
                     :preflight/no-python-exe
-                    "Python executable not found. Install Python 3.10+ and put it on PATH:
+                    "No python3 found on PATH. Install it, or add the interpreter you
+already have to PATH:
   sudo apt install python3 python3-pip    # Debian/Ubuntu
   brew install python                     # macOS"
 
@@ -170,8 +188,11 @@
   3. no conflicting Python env vars (PYTHONHOME, PYTHONPATH)"
 
                     :preflight/no-libtmux
-                    "libtmux Python package not installed. Install it:
-  pip install --user libtmux"
+                    "libtmux Python package not installed. Install it for your user:
+  python3 -m pip install --user libtmux
+On a distribution-managed Python (Ubuntu 24.04 and later) pip also refuses
+--user, so add:
+  python3 -m pip install --user --break-system-packages libtmux"
 
                     :preflight/no-tmux-binary
                     "tmux binary not found on PATH. Install it:
@@ -184,39 +205,52 @@
 ;;; Preflight Pipeline
 ;;; =============================================================================
 
+(def ^:private default-probe
+  "The preflight's impure edges, as a port. Each entry takes the run's opts and
+   returns the fact the stage decides on, so a test drives the pipeline without
+   redefing anything. `:python-exe` returns a resolved interpreter path or nil."
+  {:libpython-available? (fn [_] (check-libpython-available?))
+   :python-exe           (fn [opts] (or (:python-executable opts)
+                                        (default-python-executable)
+                                        (on-path-python (System/getenv "PATH"))))
+   :libtmux-importable?  (fn [_] (check-libtmux-importable?))
+   :tmux-binary?         (fn [_] (check-tmux-binary?))})
+
 (defn run-preflight
   "Run staged preflight checks. Returns PreflightStatus ADT value.
 
    Check order (fail-fast):
      1. libpython-clj on classpath?
-     2. Python executable exists?
+     2. Python executable exists?  (opts, then conda, then PATH)
      3. libpython-clj initializes?
      4. libtmux importable?
      5. tmux binary on PATH?
 
    Each stage fails fast with a distinct ADT variant.
-   Use `remediation-hint` for user-facing install instructions."
+   Use `remediation-hint` for user-facing install instructions.
+
+   `:probe` in opts replaces any subset of `default-probe`, which is how a test
+   injects stub facts through the port instead of redefing the checks."
   ([] (run-preflight {}))
   ([opts]
-   (or (when (= :preflight/available (:adt/variant @cached-status))
+   (or (when (= :preflight/available (some-> @cached-status :adt/variant))
          @cached-status)
-       (let [status
+       (let [probe (merge default-probe (:probe opts))
+             status
              (cond
                ;; 1. libpython-clj on classpath?
-               (not (check-libpython-available?))
+               (not ((:libpython-available? probe) opts))
                (preflight-status :preflight/no-libpython)
 
-               ;; 2. Python executable exists?
-               (let [py-exe (or (:python-executable opts) (default-python-executable))]
-                 (and (nil? py-exe)
-                      (not (.exists (java.io.File. "/usr/bin/python3")))))
+               ;; 2. Python executable exists? Same path the init below uses.
+               (nil? ((:python-exe probe) opts))
                (preflight-status :preflight/no-python-exe)
 
                :else
                (let [init-result
                      (try-effect* :preflight/python-init-fail
                                   (let [init! (requiring-resolve 'libpython-clj2.python/initialize!)
-                                        py-exe (or (:python-executable opts) (default-python-executable))]
+                                        py-exe ((:python-exe probe) opts)]
                                     (if py-exe
                                       (init! :python-executable py-exe)
                                       (init!))))]
@@ -225,11 +259,11 @@
                    (preflight-status :preflight/python-init-fail)
 
                    ;; 4. libtmux importable?
-                   (if-not (check-libtmux-importable?)
+                   (if-not ((:libtmux-importable? probe) opts)
                      (preflight-status :preflight/no-libtmux)
 
                      ;; 5. tmux binary on PATH?
-                     (if-not (check-tmux-binary?)
+                     (if-not ((:tmux-binary? probe) opts)
                        (preflight-status :preflight/no-tmux-binary)
 
                        ;; All checks passed
