@@ -29,10 +29,12 @@
 (defn scripted-host
   "A host whose single pane %9 runs \"peer one\". Each submitted line makes the
    pane busy for two polls; /compact drops the tokens and clears the goal, and
-   /goal sets it again. :sent records every submitted line in order."
+   /goal sets it again. :sent records every submitted line in order. The
+   transcript lives in the state too (:transcript), so AFTER-SUBMIT can append
+   to it the way Claude Code writes a compact boundary."
   [{:keys [tokens goal? transcript after-submit] :or {after-submit (fn [s _line] s)}}]
   (let [st (atom {:tokens tokens :busy-polls 0 :goal? goal? :clock 0
-                  :typed "" :sent [] :argv []})
+                  :typed "" :sent [] :argv [] :transcript transcript})
         submit! (fn [line]
                   (swap! st (fn [s]
                               (-> (cond-> (-> s (update :sent conj line) (assoc :busy-polls 2 :typed ""))
@@ -58,7 +60,7 @@
                   {:exit 0 :out "" :err ""})))
       :sessions (fn [] [{:pid 200 :sessionId "sid-1" :name "peer one" :cwd "/srv/peer"
                          :status (if (pos? (:busy-polls @st)) "busy" "idle") :updatedAt 1}])
-      :transcript (fn [cwd sid] (when (= ["/srv/peer" "sid-1"] [cwd sid]) transcript))
+      :transcript (fn [cwd sid] (when (= ["/srv/peer" "sid-1"] [cwd sid]) (:transcript @st)))
       :sleep! (fn [ms] (swap! st update :clock + ms))
       :now-ms (fn [] (:clock @st))}}))
 
@@ -130,8 +132,60 @@
     (swap! state assoc :busy-polls 1000000)
     (let [job (compact/start! "%9" (assoc fast :host host :idle-timeout-ms 20000))]
       (is (= :failed (:status job)))
-      (is (= {:during :wait-idle} (:error job)))
+      (is (= :wait-idle (get-in job [:error :during])))
+      (is (true? (get-in job [:error :last :busy?])) "the timeout names the last screen state")
       (is (empty? (:sent @state)) "nothing is typed into a working pane"))))
+
+(def ^:private boundary-line
+  (json/write-str {:type "system" :subtype "compact_boundary" :content "Conversation compacted"
+                   :compactMetadata {:trigger "manual" :preTokens 402635 :postTokens 28446}}))
+
+(deftest a-compaction-proven-by-the-transcript-is-not-a-timeout
+  ;; Friction 20261116133545: cc-d1a62589 sent /compact, the pane compacted
+  ;; (compact_boundary in its transcript), then a prompt from elsewhere kept it
+  ;; busy for 45 min; the job waited for idle and ended failed {:during :compact}.
+  (let [{:keys [state host]}
+        (scripted-host {:tokens 402600 :goal? false :transcript ["{\"type\":\"x\"}"]
+                        :after-submit (fn [s line]
+                                        (cond-> s
+                                          (str/starts-with? line "/compact")
+                                          (-> (assoc :tokens 402600 :busy-polls 1000000)
+                                              (update :transcript conj boundary-line))))})
+        job (compact/start! "%9" (assoc fast :host host :force? true :step-timeout-ms 60000
+                                          :reseed "catchup then resume"))]
+    (is (not= :failed (:status job)) (pr-str (dissoc job :steps)))
+    (is (= :done (:status job)))
+    (is (true? (:compacted? job)))
+    (is (= :compact-boundary (:compacted-by job)))
+    (is (= 28446 (:tokens-after-compact job)) "the boundary's postTokens")
+    (is (= ["/compact"] (:sent @state)) "nothing is typed into the pane the outside prompt keeps busy")
+    (is (= :pane-busy-after-compact (:reason job)))
+    (is (= ["catchup then resume"] (:unsent job)) "the supervisor is told what was not delivered")
+    (is (= :compacted (:step (last (:steps job)))))))
+
+(deftest a-compaction-proven-by-the-token-drop-still-reseeds
+  (let [{:keys [state host]} (scripted-host {:tokens 450000 :goal? false})
+        job (compact/start! "%9" (assoc fast :host host))]
+    (is (= :done (:status job)))
+    (is (= :ctx-drop (:compacted-by job)))
+    (is (= ["/compact" "hive workflow catchup /caveman"] (:sent @state)))
+    (is (nil? (:unsent job)))))
+
+(deftest a-compaction-that-never-happens-fails-naming-the-step-and-the-screen
+  (let [{:keys [state host]}
+        (scripted-host {:tokens 450000 :goal? false
+                        :after-submit (fn [s line]
+                                        (cond-> s (str/starts-with? line "/compact")
+                                          (assoc :tokens 450000 :busy-polls 1000000)))})
+        job (compact/start! "%9" (assoc fast :host host :step-timeout-ms 30000))]
+    (is (= :failed (:status job)))
+    (is (= :timeout (:reason job)))
+    (is (= :compact (get-in job [:error :during])))
+    (is (= :compaction (get-in job [:error :waited-for])))
+    (is (= 450000 (get-in job [:error :last :ctx-tokens])) "the last screen state is in the error")
+    (is (true? (get-in job [:error :last :busy?])))
+    (is (string? (get-in job [:error :last :activity])))
+    (is (= ["/compact"] (:sent @state)))))
 
 (deftest a-cleared-goal-is-not-restored
   (is (nil? (panes/goal-text [(goal-line goal-text) (goal-line "clear")])))
