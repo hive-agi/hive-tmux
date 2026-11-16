@@ -48,6 +48,29 @@ hive-mcp's classpath manifest scanner mounts it automatically.
 
 Capabilities: `:terminal`, `:health-reporting`, `:vessel`.
 
+## Headed sessions
+
+The `swarm` tool discovers Claude Code and Codex terminals through tmux:
+
+```json
+{"command":"tmux panes","pane_provider":"codex"}
+{"command":"tmux read","pane":"%3","lines":20}
+```
+
+`pane_provider` defaults to `all`; `claude` and `codex` select one provider.
+Each row reports its provider and capabilities. Codex rows expose terminal
+identity and the `read-screen` capability. Task identity, busy/input state,
+context usage and goal state remain unknown. Titles are display metadata.
+
+Codex screen reads return terminal text with ANSI escapes removed. Claude
+screen reads can additionally return parsed state and transcript text.
+Prompt submission, goal control and compaction currently require Claude Code;
+automatic compaction sweeps cover Claude panes. A mixed explicit compaction
+selection containing Codex starts no jobs.
+
+These inspection commands use the tmux CLI and work independently of the
+Python bridge used to create managed terminal vessels.
+
 ## Development
 
 ```bash
