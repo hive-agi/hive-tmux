@@ -18,11 +18,11 @@
                                            "<command-message>goal</command-message>\n"
                                            "<command-args>" args "</command-args>")}}))
 
-(defn- screen [{:keys [tokens busy-polls goal? human ghost voice]}]
+(defn- screen [{:keys [tokens busy-polls goal? human typed ghost voice]}]
   [(if (pos? busy-polls) "✶ Compacting… (12s · ↓ 1k tokens)" "✻ Worked for 2s")
    (str "   " tokens " tokens" (when goal? " · ◎ /goal active (3m)"))
    "──────────── peer one ─"
-   (str "\u001b[39m❯ " human (when ghost (str "\u001b[2m" ghost "\u001b[0m")))
+   (str "\u001b[39m❯ " human typed (when ghost (str "\u001b[2m" ghost "\u001b[0m")))
    "────────────"
    (str "  -- INSERT -- ⏵⏵ auto mode on" (when voice " · listening…"))])
 
@@ -31,7 +31,12 @@
    pane busy for two polls; /compact drops the tokens and clears the goal, and
    /goal sets it again. :sent records every submitted line in order. The
    transcript lives in the state too (:transcript), so AFTER-SUBMIT can append
-   to it the way Claude Code writes a compact boundary."
+   to it the way Claude Code writes a compact boundary.
+
+   What is typed shows at the prompt until Enter (:typed). A pasted frame
+   shows as Claude Code's `[Pasted text #1 +N lines]` when :collapse-paste? is
+   set in the state. :human-sends-in N makes the human's draft (:human) go out
+   after N screen reads, which starts a turn."
   [{:keys [tokens goal? transcript after-submit] :or {after-submit (fn [s _line] s)}}]
   (let [st (atom {:tokens tokens :busy-polls 0 :goal? goal? :clock 0
                   :typed "" :sent [] :argv [] :transcript transcript})
@@ -41,21 +46,34 @@
                                     (str/starts-with? line "/compact") (assoc :tokens 30000 :goal? false)
                                     (str/starts-with? line "/goal ") (assoc :goal? true)
                                     (= line "hive workflow catchup /caveman") (update :tokens + 20000))
-                                  (after-submit line)))))]
+                                  (after-submit line)))))
+        human-turn (fn [s]
+                     (if-let [n (:human-sends-in s)]
+                       (if (pos? n)
+                         (assoc s :human-sends-in (dec n))
+                         (-> s (dissoc :human-sends-in) (update :human-sent (fnil conj []) (:human s))
+                             (assoc :human nil :busy-polls 2)))
+                       s))]
     {:state st
      :host
      {:tmux! (fn tmux!
                ([argv] (tmux! argv nil))
-               ([argv _stdin]
+               ([argv stdin]
                 (swap! st update :argv conj argv)
                 (case (first argv)
                   "list-panes" {:exit 0 :out "%9\t1\t3\t1\t100\tclaude\t/srv/peer\t✳ peer one\n" :err ""}
-                  "capture-pane" (let [s @st]
+                  "capture-pane" (let [s (swap! st human-turn)]
                                    (when (pos? (:busy-polls s)) (swap! st update :busy-polls dec))
                                    {:exit 0 :out (str/join "\n" (screen s)) :err ""})
+                  "load-buffer" (do (swap! st assoc :buffer stdin) {:exit 0 :out "" :err ""})
+                  "paste-buffer" (do (swap! st (fn [s] (assoc s :typed
+                                                              (if (:collapse-paste? s)
+                                                                (str "[Pasted text #1 +" (count (str/split-lines (:buffer s))) " lines]")
+                                                                (:buffer s)))))
+                                     {:exit 0 :out "" :err ""})
                   "send-keys" (let [[_ _ _ & ks] argv]
                                 (cond (= ["Enter"] ks) (submit! (:typed @st))
-                                      (= "-l" (first ks)) (swap! st assoc :typed (second ks)))
+                                      (= "-l" (first ks)) (swap! st update :typed str (second ks)))
                                 {:exit 0 :out "" :err ""})
                   {:exit 0 :out "" :err ""})))
       :sessions (fn [] [{:pid 200 :sessionId "sid-1" :name "peer one" :cwd "/srv/peer"

@@ -7,16 +7,19 @@
    is re-seeded with catchup alone finishes catchup, finds no task and stops.
 
    Strata:
-     Promote   idle? / plan-steps          pure
-     Pipeline  run!                        drives the steps through the host port
-     Boundary  start! / job / jobs         one background job per pane
+     Promote   due? / ctx-drop / goal-after          pure
+     Pipeline  compact! / say! / goal!               drive the steps through the host port
+               (waiting: `poll`; typing: `composer`)
+     Boundary  start! / job / jobs                   one background job per pane
 
    Every effect (tmux, transcript, clock, sleep) goes through the host port,
    so the whole sequence runs in a test against a scripted screen."
   (:require [clojure.string :as str]
             [hive-dsl.result :refer [guard]]
+            [hive-tmux.claude.composer :as composer]
             [hive-tmux.claude.host :as host]
             [hive-tmux.claude.panes :as panes]
+            [hive-tmux.claude.poll :as poll]
             [taoensso.timbre :as log]))
 
 ;; Copyright (C) 2026 Pedro Gomes Branquinho (BuddhiLW) <pedrogbranquinho@gmail.com>
@@ -34,18 +37,19 @@
    :idle-timeout-ms (* 30 60 1000)
    :step-timeout-ms (* 15 60 1000)
    :start-timeout-ms 60000
+   ;; Text someone left at the prompt is waited out this long (until it is
+   ;; sent or cleared and the pane is idle again) before a send gives up as
+   ;; :pending-human-input. Nothing is ever typed over it.
+   :input-timeout-ms (* 10 60 1000)
    ;; /compact is proven when the context falls under this share of what it
    ;; was, or by a new compact_boundary line in the transcript.
    :drop-ratio 0.8})
 
 ;;; Promote
 
-(defn idle?
-  "Is ROW a Claude pane at rest? The screen shows no spinner and Claude Code's
-   own session status, when known, is not busy. A row that could not be read
-   is not idle."
-  [row]
-  (boolean (and row (some? (:ctx-tokens row)) (not (:busy? row)))))
+(def idle?
+  "Is ROW a Claude pane at rest? See `poll/idle?`."
+  poll/idle?)
 
 (defn due?
   "Should ROW be compacted at THRESHOLD tokens?"
@@ -78,51 +82,6 @@
 
 ;;; Pipeline
 
-(defn- observe [h ref]
-  (guard Exception nil (panes/pane h ref)))
-
-(defn- wait-until
-  "Poll (observe) until (pred row) holds, at most TIMEOUT-MS. The row, or nil
-   on timeout."
-  [h ref pred {:keys [poll-ms]} timeout-ms]
-  (let [{:keys [now-ms sleep!]} h
-        deadline (+ (now-ms) timeout-ms)]
-    (loop []
-      (let [row (observe h ref)]
-        (cond (pred row) row
-              (>= (now-ms) deadline) nil
-              :else (do (sleep! poll-ms) (recur)))))))
-
-(defn- wait-settled-idle
-  "Idle twice, SETTLE-MS apart: a pane between two tool calls looks idle for
-   a moment. The second row, or nil on timeout."
-  [h ref {:keys [settle-ms] :as opts} timeout-ms]
-  (let [{:keys [now-ms sleep!]} h
-        deadline (+ (now-ms) timeout-ms)]
-    (loop []
-      (when-let [first-idle (wait-until h ref idle? opts (max 0 (- deadline (now-ms))))]
-        (sleep! settle-ms)
-        (let [row (observe h ref)]
-          (cond (idle? row) (or row first-idle)
-                (>= (now-ms) deadline) nil
-                :else (recur)))))))
-
-(defn send-text!
-  "Type TEXT into PANE-ID and submit it. One line goes as literal keys; text
-   with newlines is pasted as one bracketed frame so no LF submits early. A
-   pane in vim NORMAL mode is put in insert mode first."
-  [{:keys [tmux! sleep!]} pane-id text vim-mode]
-  (when (= :normal vim-mode)
-    (tmux! ["send-keys" "-t" pane-id "i"]))
-  (if (str/includes? text "\n")
-    (let [buf (str "hive-claude-" (random-uuid))]
-      (tmux! ["load-buffer" "-b" buf "-"] text)
-      (tmux! ["paste-buffer" "-p" "-r" "-d" "-b" buf "-t" pane-id]))
-    (tmux! ["send-keys" "-t" pane-id "-l" text]))
-  (sleep! 300)
-  (tmux! ["send-keys" "-t" pane-id "Enter"])
-  nil)
-
 (defn- step! [state k data]
   (swap! state update :steps conj (assoc data :step k))
   (log/debug "[claude-compact]" k data))
@@ -136,31 +95,54 @@
    and the pane's last screen state, so a supervisor can tell a slow pane from
    a stuck one and from a step that in fact succeeded."
   [h state ref step-key data]
-  (fail! state :timeout (merge {:during step-key :last (screen-state (observe h ref))} data)))
+  (fail! state :timeout (merge {:during step-key :last (screen-state (poll/observe h ref))} data)))
 
 (defn- deliver!
-  "Type TEXT unless text already stands at the prompt: that is someone's
-   unsent input, nothing is typed over it and the job stops as
-   :pending-human-input. True when TEXT was sent."
-  [h state ref pane-id text step-key]
-  (let [row (observe h ref)]
-    (if-let [input (:input row)]
-      (do (swap! state assoc :status :skipped :reason :pending-human-input
-                 :error {:during step-key :input input})
-          false)
-      (do (send-text! h pane-id text (:vim-mode row))
-          (step! state step-key {:sent text})
-          true))))
+  "Type TEXT once the prompt is free (no one's text there, pane idle); true
+   when it was submitted. Text someone left at the prompt is never typed over:
+   it is waited out (`poll/wait-input-clear`, which also outlasts the turn it
+   starts once sent) for at most :input-timeout-ms, while the job shows it
+   under :waiting-on, and not at all when that is 0 or :wait-idle? is false.
+   Still there, the job stops :skipped :pending-human-input naming the pane
+   and the text; a pane that stayed busy stops it :skipped :busy. A slash
+   command the composer does not hold back stops it :failed
+   :composer-mismatch with Enter unpressed (`composer/send-text!`)."
+  [h state ref pane-id text step-key opts]
+  (let [row0 (poll/observe h ref)
+        free? (and (poll/idle? row0) (nil? (:input row0)))
+        wait-ms (if (false? (:wait-idle? opts)) 0 (or (:input-timeout-ms opts) 0))
+        on (if (:input row0) {:pending-human-input (:input row0)} {:pane-busy true})
+        row (cond free? row0
+                  (pos? wait-ms) (do (step! state :wait-input (assoc on :during step-key :timeout-ms wait-ms))
+                                     (swap! state assoc :waiting-on (assoc on :during step-key))
+                                     (try (poll/wait-input-clear h ref opts wait-ms)
+                                          (finally (swap! state dissoc :waiting-on)))))]
+    (if-not row
+      (let [end (or (poll/observe h ref) row0)
+            input (or (:input end) (:input row0))]
+        (swap! state assoc :status :skipped :reason (if input :pending-human-input :busy)
+               :error (cond-> {:during step-key :pane pane-id :name (:name end)
+                               :waited-ms wait-ms :last (screen-state end)}
+                        input (assoc :input input
+                                     :hint (str "Text stands at the prompt of " pane-id " and was not typed over. "
+                                                "Send or clear it, then start the job again."))))
+        false)
+      (let [{:keys [submitted? composer]} (composer/send-text! h pane-id text (:vim-mode row))]
+        (if submitted?
+          (do (step! state step-key {:sent text}) true)
+          (fail! state :composer-mismatch
+                 {:during step-key :pane pane-id :expected text :composer composer
+                  :hint "Enter was not pressed: the composer does not hold the command as typed. Clear it, then start the job again."}))))))
 
 (defn- send-and-settle!
   "Send TEXT, wait for the turn it starts to end. Returns the idle row, or nil
    when it stopped (status is set). For an intermediate step: the next send
    must not land on a working pane."
   [h state ref pane-id text step-key opts]
-  (when (deliver! h state ref pane-id text step-key)
+  (when (deliver! h state ref pane-id text step-key opts)
     ;; The turn may start and end between two polls; seeing busy is not required.
-    (wait-until h ref :busy? opts (:start-timeout-ms opts))
-    (or (wait-settled-idle h ref opts (:step-timeout-ms opts))
+    (poll/wait-until h ref :busy? opts (:start-timeout-ms opts))
+    (or (poll/wait-settled-idle h ref opts (:step-timeout-ms opts))
         (timeout! h state ref step-key {:waited-for :settled-idle}))))
 
 (defn- send-and-start!
@@ -168,13 +150,13 @@
    working, or, for a /goal, the goal shown active, within :start-timeout-ms.
    Waiting for idle here would wait on the very work the send restarts.
    {:started? bool :row row}; an unacknowledged delivery is :started? false,
-   not a hang. Nil when pending input stopped it (status is set)."
+   not a hang. Nil when the delivery stopped it (status is set)."
   [h state ref pane-id text step-key opts]
-  (when (deliver! h state ref pane-id text step-key)
+  (when (deliver! h state ref pane-id text step-key opts)
     (let [goal? (str/starts-with? text "/goal ")
-          seen (wait-until h ref #(boolean (or (:busy? %) (and goal? (:goal-active? %))))
-                           opts (:start-timeout-ms opts))]
-      {:started? (boolean seen) :row (or seen (observe h ref))})))
+          seen (poll/wait-until h ref #(boolean (or (:busy? %) (and goal? (:goal-active? %))))
+                                opts (:start-timeout-ms opts))]
+      {:started? (boolean seen) :row (or seen (poll/observe h ref))})))
 
 (defn- boundaries-of
   "The compact boundaries in the transcript of ROW's session, or nil when it
@@ -194,11 +176,11 @@
    stopped (status is set)."
   [h state ref pane-id text before opts]
   (let [{:keys [now-ms sleep!]} h
-        n0 (some-> (boundaries-of h (observe h ref)) count)]
-    (when (deliver! h state ref pane-id text :compact)
+        n0 (some-> (boundaries-of h (poll/observe h ref)) count)]
+    (when (deliver! h state ref pane-id text :compact opts)
       (let [deadline (+ (now-ms) (:step-timeout-ms opts))
             evidence (loop []
-                       (let [row (observe h ref)
+                       (let [row (poll/observe h ref)
                              ev (or (ctx-drop before row (:drop-ratio opts))
                                     (boundary-seen n0 (boundaries-of h row)))]
                          (cond ev ev
@@ -210,7 +192,7 @@
               (swap! state assoc :compacted? true :compacted-by (:by evidence)
                      :tokens-after-compact (:tokens evidence))
               {:compacted evidence
-               :row (wait-settled-idle h ref opts (:step-timeout-ms opts))}))))))
+               :row (poll/wait-settled-idle h ref opts (:step-timeout-ms opts))}))))))
 
 (defn goal-after
   "The goal to set after the re-seed. GOAL (an override) wins over CAPTURED;
@@ -234,7 +216,7 @@
    into a working pane is what this job never does."
   [h state ref opts]
   (let [opts (merge defaults opts)
-        start (observe h ref)]
+        start (poll/observe h ref)]
     (swap! state assoc :status :running :pane (:pane start) :name (:name start)
            :tokens-before (:ctx-tokens start))
     (cond
@@ -247,7 +229,7 @@
       :else
       (let [pane-id (:pane start)]
         (when-let [ready (do (step! state :wait-idle {})
-                             (or (wait-settled-idle h ref opts (:idle-timeout-ms opts))
+                             (or (poll/wait-settled-idle h ref opts (:idle-timeout-ms opts))
                                  (timeout! h state ref :wait-idle {:waited-for :settled-idle})))]
           (let [captured (when (and (:restore-goal? opts) (:goal-active? ready) (:session-id ready))
                            (panes/goal-text (or ((:transcript h) (:cwd ready) (:session-id ready)) [])))
@@ -265,7 +247,7 @@
               (cond
                 (and (nil? row) (seq sends))
                 (swap! state assoc :status :done :reason :pane-busy-after-compact
-                       :unsent (mapv first sends) :last (screen-state (observe h ref)))
+                       :unsent (mapv first sends) :last (screen-state (poll/observe h ref)))
 
                 ;; The last send restarts work: it ends the job once acknowledged.
                 :else
@@ -276,7 +258,7 @@
                       (when-let [{:keys [started? row]} (send-and-start! h state ref pane-id text k opts)]
                         (swap! state assoc :status :done :started? started?
                                :tokens-after (:ctx-tokens row) :goal-active-after? (:goal-active? row)))
-                      (let [end (observe h ref)]
+                      (let [end (poll/observe h ref)]
                         (swap! state assoc :status :done :tokens-after (:ctx-tokens end)
                                :goal-active-after? (:goal-active? end))))))))))))
     @state))
@@ -285,13 +267,13 @@
   "The pane's first row, waited to a settled idle when WAIT-IDLE? (else it
    must already be idle). Nil when it stopped (status is set)."
   [h state ref {:keys [wait-idle?] :as opts}]
-  (let [start (observe h ref)]
+  (let [start (poll/observe h ref)]
     (swap! state assoc :status :running :pane (:pane start) :name (:name start)
            :tokens-before (:ctx-tokens start))
     (cond
       (nil? start) (fail! state :no-such-pane {:ref ref})
       wait-idle? (do (step! state :wait-idle {})
-                     (or (wait-settled-idle h ref opts (:idle-timeout-ms opts))
+                     (or (poll/wait-settled-idle h ref opts (:idle-timeout-ms opts))
                          (timeout! h state ref :wait-idle {:waited-for :settled-idle})))
       (idle? start) start
       :else (do (swap! state assoc :status :skipped :reason :busy) nil))))
@@ -300,28 +282,25 @@
   "Submit OPTS :text to the pane REF names as one prompt. Waits for a settled
    idle first unless :wait-idle? is false (then a busy pane is skipped). Done
    once the pane starts working on it, or settles: the reply itself can take
-   an hour, read it later with `read`. Text at the prompt stops the job."
+   an hour, read it later with `read`. Text at the prompt stops the job at
+   once: a say is not queued behind someone's draft."
   [h state ref opts]
   (let [opts (merge defaults {:wait-idle? true} opts)
         text (some-> (:text opts) str/trim not-empty)]
     (if-not text
       (fail! state :no-text {})
-      (when-let [_ready (start-row h state ref opts)]
-        (let [row (observe h ref)]
-          (if-let [input (:input row)]
-            (swap! state assoc :status :skipped :reason :pending-human-input
-                   :error {:during :say :input input})
-            (do (send-text! h (:pane row) text (:vim-mode row))
-                (step! state :say {:sent text})
-                (let [started (wait-until h ref :busy? opts (:start-timeout-ms opts))]
-                  (swap! state assoc :status :done :delivered true
-                         :started? (boolean started)))))))))
+      (when-let [ready (start-row h state ref opts)]
+        (when (deliver! h state ref (:pane ready) text :say (assoc opts :input-timeout-ms 0))
+          (let [started (poll/wait-until h ref :busy? opts (:start-timeout-ms opts))]
+            (swap! state assoc :status :done :delivered true
+                   :started? (boolean started)))))))
   @state)
 
 (defn goal!
   "Set the /goal of the pane REF names without compacting it: OPTS :goal
    replaces, :goal-append extends the pane's active goal (read from its
-   transcript). Waits for a settled idle; text at the prompt stops the job."
+   transcript). Waits for a settled idle; text at the prompt is waited out up
+   to :input-timeout-ms (`deliver!`), then stops the job."
   [h state ref opts]
   (let [opts (merge defaults {:wait-idle? true} opts)]
     (when-let [ready (start-row h state ref opts)]
@@ -368,7 +347,7 @@
   (let [h (or (:host opts) (host/host))
         kind (or (:kind opts) :compact)
         runner (get runners kind)
-        row (observe h ref)]
+        row (poll/observe h ref)]
     (cond
       (nil? runner) {:error :unknown-kind :kind kind}
       (and row (active-for (:pane row))) {:error :already-running :job (active-for (:pane row))}
