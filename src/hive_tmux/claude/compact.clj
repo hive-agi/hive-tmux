@@ -33,7 +33,10 @@
    :settle-ms 10000
    :idle-timeout-ms (* 30 60 1000)
    :step-timeout-ms (* 15 60 1000)
-   :start-timeout-ms 60000})
+   :start-timeout-ms 60000
+   ;; /compact is proven when the context falls under this share of what it
+   ;; was, or by a new compact_boundary line in the transcript.
+   :drop-ratio 0.8})
 
 ;;; Promote
 
@@ -48,6 +51,30 @@
   "Should ROW be compacted at THRESHOLD tokens?"
   [row threshold]
   (boolean (some-> (:ctx-tokens row) (>= threshold))))
+
+(defn screen-state
+  "What a timeout reports of the pane's last ROW: enough for a supervisor to
+   tell a slow pane from a stuck one without reading the screen itself."
+  [row]
+  (when row
+    (into {} (remove (comp nil? val))
+          (select-keys row [:ctx-tokens :busy? :activity :status :goal-active? :input :suggestion]))))
+
+(defn ctx-drop
+  "Evidence from ROW that a compaction ran: its context fell below DROP-RATIO
+   of BEFORE tokens. {:by :ctx-drop :tokens n}, or nil."
+  [before row drop-ratio]
+  (let [now (:ctx-tokens row)]
+    (when (and (number? before) (pos? before) (number? now) (< now (* drop-ratio before)))
+      {:by :ctx-drop :tokens now})))
+
+(defn boundary-seen
+  "Evidence from BOUNDARIES (`panes/compact-boundaries` of the transcript now)
+   that a compaction finished after the BEFORE-COUNT boundaries there were
+   when /compact was sent. {:by :compact-boundary :tokens post}, or nil."
+  [before-count boundaries]
+  (when (and (some? before-count) (> (count boundaries) before-count))
+    {:by :compact-boundary :tokens (:post-tokens (peek boundaries))}))
 
 ;;; Pipeline
 
@@ -104,6 +131,13 @@
   (swap! state assoc :status :failed :reason reason :error data)
   nil)
 
+(defn- timeout!
+  "Fail as :timeout DURING STEP-KEY, naming what the step waited for (DATA)
+   and the pane's last screen state, so a supervisor can tell a slow pane from
+   a stuck one and from a step that in fact succeeded."
+  [h state ref step-key data]
+  (fail! state :timeout (merge {:during step-key :last (screen-state (observe h ref))} data)))
+
 (defn- deliver!
   "Type TEXT unless text already stands at the prompt: that is someone's
    unsent input, nothing is typed over it and the job stops as
@@ -127,7 +161,7 @@
     ;; The turn may start and end between two polls; seeing busy is not required.
     (wait-until h ref :busy? opts (:start-timeout-ms opts))
     (or (wait-settled-idle h ref opts (:step-timeout-ms opts))
-        (fail! state :timeout {:during step-key}))))
+        (timeout! h state ref step-key {:waited-for :settled-idle}))))
 
 (defn- send-and-start!
   "Send TEXT as a job's LAST step and end on the pane's acknowledgement: seen
@@ -142,6 +176,42 @@
                            opts (:start-timeout-ms opts))]
       {:started? (boolean seen) :row (or seen (observe h ref))})))
 
+(defn- boundaries-of
+  "The compact boundaries in the transcript of ROW's session, or nil when it
+   cannot be read."
+  [h row]
+  (when (:session-id row)
+    (guard Exception nil
+      (panes/compact-boundaries (or ((:transcript h) (:cwd row) (:session-id row)) [])))))
+
+(defn- send-and-compact!
+  "Send the /compact TEXT and wait for proof that the compaction ran, not for
+   a screen marker: the context count fell under :drop-ratio of BEFORE, or a
+   new compact_boundary line is in the transcript. Neither within
+   :step-timeout-ms is a :timeout naming the step and the last screen. Proof
+   seen, wait for a settled idle so the re-seed does not land on a working
+   pane. Returns {:compacted evidence :row idle-row-or-nil}, or nil when it
+   stopped (status is set)."
+  [h state ref pane-id text before opts]
+  (let [{:keys [now-ms sleep!]} h
+        n0 (some-> (boundaries-of h (observe h ref)) count)]
+    (when (deliver! h state ref pane-id text :compact)
+      (let [deadline (+ (now-ms) (:step-timeout-ms opts))
+            evidence (loop []
+                       (let [row (observe h ref)
+                             ev (or (ctx-drop before row (:drop-ratio opts))
+                                    (boundary-seen n0 (boundaries-of h row)))]
+                         (cond ev ev
+                               (>= (now-ms) deadline) nil
+                               :else (do (sleep! (:poll-ms opts)) (recur)))))]
+        (if-not evidence
+          (timeout! h state ref :compact {:waited-for :compaction :tokens-before before})
+          (do (step! state :compacted evidence)
+              (swap! state assoc :compacted? true :compacted-by (:by evidence)
+                     :tokens-after-compact (:tokens evidence))
+              {:compacted evidence
+               :row (wait-settled-idle h ref opts (:step-timeout-ms opts))}))))))
+
 (defn goal-after
   "The goal to set after the re-seed. GOAL (an override) wins over CAPTURED;
    APPEND is added to whichever applies. Nil when there is nothing to set."
@@ -155,7 +225,13 @@
   "Compact the pane REF names, through host H, recording progress in STATE
    (an atom). OPTS: see `defaults`, plus :force? (ignore the threshold),
    :instructions (text after /compact), :goal (replace the goal) and
-   :goal-append (extend it). Returns STATE's final value."
+   :goal-append (extend it). Returns STATE's final value.
+
+   The /compact step ends on proof that the compaction ran (`send-and-compact!`),
+   never on a screen marker. A compaction proven while the pane then stays busy
+   (someone else gave it work) is :done with :reason :pane-busy-after-compact
+   and the texts it did not type under :unsent: the recycle worked, and typing
+   into a working pane is what this job never does."
   [h state ref opts]
   (let [opts (merge defaults opts)
         start (observe h ref)]
@@ -172,31 +248,37 @@
       (let [pane-id (:pane start)]
         (when-let [ready (do (step! state :wait-idle {})
                              (or (wait-settled-idle h ref opts (:idle-timeout-ms opts))
-                                 (fail! state :timeout {:during :wait-idle})))]
+                                 (timeout! h state ref :wait-idle {:waited-for :settled-idle})))]
           (let [captured (when (and (:restore-goal? opts) (:goal-active? ready) (:session-id ready))
                            (panes/goal-text (or ((:transcript h) (:cwd ready) (:session-id ready)) [])))
-                goal (goal-after opts captured)]
+                goal (goal-after opts captured)
+                reseed (when-not (str/blank? (:reseed opts)) (:reseed opts))
+                sends (cond-> [] reseed (conj [reseed :reseed]) goal (conj [(str "/goal " goal) :goal-restored]))]
             (step! state :goal-captured {:captured captured :goal goal
                                          :goal-active? (:goal-active? ready)})
             (swap! state assoc :goal goal)
             (when (and (:goal-active? ready) (:restore-goal? opts) (nil? captured) (nil? (:goal opts)))
               (step! state :goal-unreadable {:note "goal active but no /goal text in the transcript; it will not be restored"}))
-            (when (send-and-settle! h state ref pane-id
-                                    (str "/compact" (some->> (:instructions opts) str/trim not-empty (str " ")))
-                                    :compact opts)
-              ;; The last send restarts work: it ends the job once acknowledged.
-              (let [reseed (when-not (str/blank? (:reseed opts)) (:reseed opts))
-                    last-send (cond goal [(str "/goal " goal) :goal-restored]
-                                    reseed [reseed :reseed])]
-                (when (or (nil? goal) (nil? reseed)
-                          (send-and-settle! h state ref pane-id reseed :reseed opts))
-                  (if-let [[text k] last-send]
-                    (when-let [{:keys [started? row]} (send-and-start! h state ref pane-id text k opts)]
-                      (swap! state assoc :status :done :started? started?
-                             :tokens-after (:ctx-tokens row) :goal-active-after? (:goal-active? row)))
-                    (let [end (observe h ref)]
-                      (swap! state assoc :status :done :tokens-after (:ctx-tokens end)
-                             :goal-active-after? (:goal-active? end)))))))))))
+            (when-let [{:keys [row]} (send-and-compact! h state ref pane-id
+                                                        (str "/compact" (some->> (:instructions opts) str/trim not-empty (str " ")))
+                                                        (:ctx-tokens ready) opts)]
+              (cond
+                (and (nil? row) (seq sends))
+                (swap! state assoc :status :done :reason :pane-busy-after-compact
+                       :unsent (mapv first sends) :last (screen-state (observe h ref)))
+
+                ;; The last send restarts work: it ends the job once acknowledged.
+                :else
+                (let [last-send (peek sends)]
+                  (when (or (< (count sends) 2)
+                            (send-and-settle! h state ref pane-id reseed :reseed opts))
+                    (if-let [[text k] last-send]
+                      (when-let [{:keys [started? row]} (send-and-start! h state ref pane-id text k opts)]
+                        (swap! state assoc :status :done :started? started?
+                               :tokens-after (:ctx-tokens row) :goal-active-after? (:goal-active? row)))
+                      (let [end (observe h ref)]
+                        (swap! state assoc :status :done :tokens-after (:ctx-tokens end)
+                               :goal-active-after? (:goal-active? end))))))))))))
     @state))
 
 (defn- start-row
@@ -210,7 +292,7 @@
       (nil? start) (fail! state :no-such-pane {:ref ref})
       wait-idle? (do (step! state :wait-idle {})
                      (or (wait-settled-idle h ref opts (:idle-timeout-ms opts))
-                         (fail! state :timeout {:during :wait-idle})))
+                         (timeout! h state ref :wait-idle {:waited-for :settled-idle})))
       (idle? start) start
       :else (do (swap! state assoc :status :skipped :reason :busy) nil))))
 

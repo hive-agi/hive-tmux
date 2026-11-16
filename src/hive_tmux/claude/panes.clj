@@ -108,6 +108,24 @@
               (not-empty (some-> text str/trim)))))
         (rseq (vec lines))))
 
+(defn compact-boundaries
+  "Every compaction LINES (a transcript, oldest first) records, oldest first:
+   Claude Code writes one `{\"type\":\"system\",\"subtype\":\"compact_boundary\"}`
+   line when a /compact (or an auto compaction) has finished, whatever the
+   screen showed meanwhile. Each is {:pre-tokens :post-tokens :trigger}, a
+   key nil when the line does not carry it."
+  [lines]
+  (into []
+        (keep (fn [line]
+                (when (str/includes? (str line) "compact_boundary")
+                  (let [e (guard Exception nil (json/read-str line :key-fn keyword))]
+                    (when (and (= "system" (:type e)) (= "compact_boundary" (:subtype e)))
+                      (let [m (:compactMetadata e)]
+                        {:pre-tokens (:preTokens m)
+                         :post-tokens (:postTokens m)
+                         :trigger (:trigger m)}))))))
+        lines))
+
 (defn pane-row
   "One pane's row from its tmux PANE map, its SCREEN facts and SESSIONS."
   [pane facts sessions]
