@@ -65,6 +65,7 @@
     (:instructions params) (assoc :instructions (str (:instructions params)))
     (:goal params) (assoc :goal (str (:goal params)))
     (:goal_append params) (assoc :goal-append (str (:goal_append params)))
+    (some? (:input_timeout_ms params)) (assoc :input-timeout-ms (int-param (:input_timeout_ms params) nil))
     (bool (:force params) false) (assoc :force? true)))
 
 (defn- start-job!
@@ -76,10 +77,36 @@
 (defn- resolve-one [h ref]
   (some #(when (some #{ref} (refs-of %)) %) (panes/panes h)))
 
+(defn caller-pid
+  "The pid in a `coordinator:<pid>` caller id (the host stamps it on every call
+   as `_caller_id`), or nil. It is the pid of the caller's own Claude Code
+   process, which is the :pid of the session its pane row joins."
+  [caller-id]
+  (let [prefix "coordinator:"]
+    (when (and (string? caller-id) (str/starts-with? caller-id prefix))
+      (let [digits (subs caller-id (count prefix))]
+        (when (and (<= 1 (count digits) 10) (every? #(Character/isDigit ^char %) digits))
+          (let [pid (parse-long digits)] (when (pos? pid) pid)))))))
+
+(defn own-pane?
+  "Does ROW show the session of the caller whose pid is PID?"
+  [row pid]
+  (boolean (and pid (number? (:pid row)) (= pid (long (:pid row))))))
+
+(def self-compact
+  "Where the caller compacts its own pane instead."
+  {:use "swarm steer self input=/compact then=<reseed> dry_run=false"
+   :why (str "a compact job waits for the pane to settle idle, and your own pane is busy with this very turn"
+             " until it ends; under a /goal Stop hook it never ends, so the job could only time out."
+             " steer self types /compact into your composer and the re-seed once the window reset.")})
+
 (defn compact-cmd
   "pane given: compact those panes, whatever their size.
    pane omitted: every Claude pane over threshold, except those in exclude.
-   dry_run: say what would be compacted, start nothing."
+   dry_run: say what would be compacted, start nothing.
+   The caller's own pane (`_caller_id`) is never compacted here: named, the
+   call is refused at once; in a sweep it is left out and reported, both
+   pointing at `swarm steer self` (see `self-compact`)."
   [params]
   (let [h (h-of params)
         opts (compact-opts params h)
@@ -87,22 +114,32 @@
         exclude (set (as-list (:exclude params)))
         rows (panes/panes h)
         refs (as-list (:pane params))
-        targets (if refs
+        me (caller-pid (:_caller_id params))
+        matched (if refs
                   (keep (fn [ref] (some #(when (some #{ref} (refs-of %)) %) rows)) refs)
                   (filter #(and (not (some exclude (refs-of %))) (compact/due? % threshold)) rows))
+        own (into [] (comp (filter #(own-pane? % me)) (distinct)) matched)
+        own-view (when (seq own)
+                   (assoc self-compact :own-pane (mapv #(select-keys % [:pane :name :ctx-tokens :goal-active?]) own)))
+        targets (remove #(own-pane? % me) matched)
         plan (mapv #(select-keys % [:pane :target :name :ctx-tokens :busy? :goal-active?]) targets)]
     (cond
-      (and refs (empty? targets))
+      (and refs (empty? matched))
       (r/err :tmux/no-such-pane {:pane refs :known (mapv :name rows)})
 
+      (and refs (seq own))
+      (r/err :tmux/own-pane own-view)
+
       (bool (:dry_run params) false)
-      (r/ok {:dry-run true :threshold threshold :would-compact plan})
+      (r/ok (cond-> {:dry-run true :threshold threshold :would-compact plan}
+              own-view (assoc :skipped-own-pane own-view)))
 
       :else
-      (r/ok {:threshold threshold
-             :started (mapv #(start-job! (:pane %) :compact (cond-> opts refs (assoc :force? true)))
-                            targets)
-             :hint "Poll with `swarm tmux job job_id=<id>`; status goes queued -> running -> done | skipped | failed."}))))
+      (r/ok (cond-> {:threshold threshold
+                     :started (mapv #(start-job! (:pane %) :compact (cond-> opts refs (assoc :force? true)))
+                                    targets)
+                     :hint "Poll with `swarm tmux job job_id=<id>`; status goes queued -> running -> done | skipped | failed."}
+              own-view (assoc :skipped-own-pane own-view))))))
 
 (defn job-cmd [{:keys [job_id]}]
   (if job_id
@@ -126,7 +163,8 @@
                               (cond-> {:host h}
                                 (:goal params) (assoc :goal (str (:goal params)))
                                 (:goal_append params) (assoc :goal-append (str (:goal_append params)))
-                                (some? (:wait_idle params)) (assoc :wait-idle? (bool (:wait_idle params) true))))))))
+                                (some? (:wait_idle params)) (assoc :wait-idle? (bool (:wait_idle params) true))
+                                (some? (:input_timeout_ms params)) (assoc :input-timeout-ms (int-param (:input_timeout_ms params) nil))))))))
 
 (defn say-cmd
   "Submit one prompt to a pane."
@@ -178,11 +216,11 @@
               :doc "Every Claude Code pane as data: pane, target, name, session-id, cwd, ctx-tokens, busy?, status, goal-active?, goal-age, activity, input (text typed at the prompt) and suggestion (Claude Code's dimmed ghost text there, typed by no one; never relay it as the owner's words). include_goal=true adds the /goal text."
               :params [:include_goal :socket_name]}
    "compact" {:fn compact-cmd
-              :doc "Wait idle, capture the /goal, send /compact, re-seed (default \"hive workflow catchup /caveman\"), restore the goal. pane=<ref,...> compacts those panes whatever their size; no pane = every pane over threshold (default 400000) minus exclude. Background job; returns job ids."
-              :params [:pane :threshold :reseed :restore_goal :goal :goal_append :instructions :exclude :force :dry_run :socket_name]}
+              :doc "Wait idle, capture the /goal, send /compact, re-seed (default \"hive workflow catchup /caveman\"), restore the goal. pane=<ref,...> compacts those panes whatever their size; no pane = every pane over threshold (default 400000) minus exclude. Text someone left at a prompt is waited out up to input_timeout_ms (default 600000), never typed over; the job shows it under :waiting-on. Your OWN pane is refused (a sweep leaves it out): compact yourself with `swarm steer self input=/compact then=<reseed> dry_run=false`. Background job; returns job ids."
+              :params [:pane :threshold :reseed :restore_goal :goal :goal_append :instructions :exclude :force :dry_run :input_timeout_ms :socket_name]}
    "goal"    {:fn goal-cmd
-              :doc "Arm or replace a pane's /goal WITHOUT compacting: goal=<text> replaces, goal_append=<text> extends the active one. Waits for a settled idle (wait_idle=false: skip a busy pane); text at the prompt stops it. Background job; job ends with goal-active-after?."
-              :params [:pane :goal :goal_append :wait_idle :socket_name]}
+              :doc "Arm or replace a pane's /goal WITHOUT compacting: goal=<text> replaces, goal_append=<text> extends the active one. Waits for a settled idle (wait_idle=false: skip a busy pane); text at the prompt is waited out up to input_timeout_ms (not with wait_idle=false), then stops it. Background job; job ends with goal-active-after?."
+              :params [:pane :goal :goal_append :wait_idle :input_timeout_ms :socket_name]}
    "say"     {:fn say-cmd
               :doc "Submit one prompt (text=) to a pane. Waits for a settled idle unless wait_idle=false; refuses (skipped, pending-human-input) when the prompt line holds text. Job is done once the pane starts on it; read the answer later with `tmux read`."
               :params [:pane :text :wait_idle :socket_name]}
@@ -247,6 +285,7 @@
    "exclude"      {:type "string" :description "[tmux compact] Pane refs a sweep skips, comma-separated (e.g. your own pane)."}
    "force"        {:type "boolean" :description "[tmux compact] Compact even under threshold."}
    "dry_run"      {:type "boolean" :description "[tmux compact] List what would be compacted; start nothing."}
+   "input_timeout_ms" {:type "integer" :description "[tmux compact|goal] How long text someone left at the prompt is waited out before the job skips as pending-human-input (default 600000; 0 skips at once)."}
    "include_goal" {:type "boolean" :description "[tmux panes] Also read each goal-active pane's /goal text."}
    "socket_name"  {:type "string" :description "[tmux panes|compact] tmux -L socket; default server when omitted."}
    "goal"         {:type "string" :description "[tmux compact] Goal to set after the re-seed, replacing the pane's own /goal."}
