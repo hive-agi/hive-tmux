@@ -43,6 +43,17 @@
         (number? x) (long x)
         :else (or (parse-long (str x)) default)))
 
+(defn- between-turns-param
+  "How `compact` proves a pane is at rest: `auto` (the default) reads a
+   /goal-active pane at its single turn boundary, `true` forces that, `false`
+   forces the stricter settled idle. Anything else is `auto`, never a silent
+   `true`: guessing wrong would type into a working turn."
+  [x]
+  (let [s (str/lower-case (str/trim (str x)))]
+    (cond (contains? #{"true" "1" "yes" "on"} s) true
+          (contains? #{"false" "0" "no" "off"} s) false
+          :else :auto)))
+
 (defn- h-of [{:keys [socket_name]}]
   (if socket_name (host/cli-host {:socket-name socket_name}) (host/host)))
 
@@ -66,6 +77,7 @@
     (:goal params) (assoc :goal (str (:goal params)))
     (:goal_append params) (assoc :goal-append (str (:goal_append params)))
     (some? (:input_timeout_ms params)) (assoc :input-timeout-ms (int-param (:input_timeout_ms params) nil))
+    (some? (:between_turns params)) (assoc :between-turns? (between-turns-param (:between_turns params)))
     (bool (:force params) false) (assoc :force? true)))
 
 (defn- start-job!
@@ -96,9 +108,10 @@
 (def self-compact
   "Where the caller compacts its own pane instead."
   {:use "swarm steer self input=/compact then=<reseed> dry_run=false"
-   :why (str "a compact job waits for the pane to settle idle, and your own pane is busy with this very turn"
-             " until it ends; under a /goal Stop hook it never ends, so the job could only time out."
-             " steer self types /compact into your composer and the re-seed once the window reset.")})
+   :why (str "a compact job waits for the pane to be at rest, and your own pane is working on this very"
+             " turn until it ends. A /goal pane is read at its turn boundary, but your own boundary is the"
+             " Stop hook this run is inside, so a job could only wait here: steer self types /compact into"
+             " your composer and the re-seed once the window reset.")})
 
 (defn compact-cmd
   "pane given: compact those panes, whatever their size.
@@ -216,8 +229,8 @@
               :doc "Every Claude Code pane as data: pane, target, name, session-id, cwd, ctx-tokens, busy?, status, goal-active?, goal-age, activity, input (text typed at the prompt) and suggestion (Claude Code's dimmed ghost text there, typed by no one; never relay it as the owner's words). include_goal=true adds the /goal text."
               :params [:include_goal :socket_name]}
    "compact" {:fn compact-cmd
-              :doc "Wait idle, capture the /goal, send /compact, re-seed (default \"hive workflow catchup /caveman\"), restore the goal. pane=<ref,...> compacts those panes whatever their size; no pane = every pane over threshold (default 400000) minus exclude. Text someone left at a prompt is waited out up to input_timeout_ms (default 600000), never typed over; the job shows it under :waiting-on. Your OWN pane is refused (a sweep leaves it out): compact yourself with `swarm steer self input=/compact then=<reseed> dry_run=false`. Background job; returns job ids."
-              :params [:pane :threshold :reseed :restore_goal :goal :goal_append :instructions :exclude :force :dry_run :input_timeout_ms :socket_name]}
+              :doc "Wait for rest, capture the /goal, send /compact, re-seed (default \"hive workflow catchup /caveman\"), restore the goal. pane=<ref,...> compacts those panes whatever their size; no pane = every pane over threshold (default 400000) minus exclude. Rest is a settled idle, except on a pane whose /goal is active: a /goal Stop hook restarts the next turn within a poll, so there the job reads the single turn boundary between turns (between_turns=auto, the default; true forces it, false forces the settled idle). Text someone left at a prompt is waited out up to input_timeout_ms (default 600000), never typed over; the job shows it under :waiting-on. Your OWN pane is refused (a sweep leaves it out): compact yourself with `swarm steer self input=/compact then=<reseed> dry_run=false`. Background job; returns job ids."
+              :params [:pane :threshold :reseed :restore_goal :goal :goal_append :instructions :exclude :force :dry_run :input_timeout_ms :between_turns :socket_name]}
    "goal"    {:fn goal-cmd
               :doc "Arm or replace a pane's /goal WITHOUT compacting: goal=<text> replaces, goal_append=<text> extends the active one. Waits for a settled idle (wait_idle=false: skip a busy pane); text at the prompt is waited out up to input_timeout_ms (not with wait_idle=false), then stops it. Background job; job ends with goal-active-after?."
               :params [:pane :goal :goal_append :wait_idle :input_timeout_ms :socket_name]}
@@ -286,6 +299,7 @@
    "force"        {:type "boolean" :description "[tmux compact] Compact even under threshold."}
    "dry_run"      {:type "boolean" :description "[tmux compact] List what would be compacted; start nothing."}
    "input_timeout_ms" {:type "integer" :description "[tmux compact|goal] How long text someone left at the prompt is waited out before the job skips as pending-human-input (default 600000; 0 skips at once)."}
+   "between_turns" {:type "string" :description "[tmux compact] How rest is proven: auto (default) reads a /goal-active pane at its single turn boundary and every other pane at a settled idle; true forces the turn boundary, false forces the settled idle."}
    "include_goal" {:type "boolean" :description "[tmux panes] Also read each goal-active pane's /goal text."}
    "socket_name"  {:type "string" :description "[tmux panes|compact] tmux -L socket; default server when omitted."}
    "goal"         {:type "string" :description "[tmux compact] Goal to set after the re-seed, replacing the pane's own /goal."}
