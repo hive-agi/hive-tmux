@@ -1,8 +1,9 @@
 (ns hive-tmux.claude.registry
-  "The `tmux` subdomain of the host's `swarm` tool: Claude Code panes as data
-   for a supervisor, and compaction with re-seed and goal restore.
+  "The `tmux` subdomain of the host's `swarm` tool: Claude and Codex discovery,
+   with Claude compaction, re-seed and goal restore.
 
-     swarm tmux panes     every Claude pane: pane, target, name, session id, cwd,
+     swarm tmux panes     assistant panes with provider and capabilities;
+                          Claude: pane, target, name, session id, cwd,
                           ctx-tokens, busy?, status, goal-active?, goal-age
      swarm tmux compact   compact one pane, or every pane over threshold
      swarm tmux job       one compaction job by id, or all of them"
@@ -64,9 +65,17 @@
   [(:pane row) (:target row) (:name row) (:session-id row)])
 
 (defn panes-cmd [params]
-  (let [rows (panes/panes (h-of params) {:include-goal? (bool (:include_goal params) false)})]
-    (r/ok {:count (count rows)
-           :panes (mapv row-view rows)})))
+  (let [given (:pane_provider params)
+        provider (cond (nil? given) :all
+                       (keyword? given) given
+                       (string? given) (keyword given)
+                       :else nil)]
+    (if-not (#{:claude :codex :all} provider)
+      (r/err :tmux/unsupported-provider {:provider given :supported [:all :claude :codex]})
+      (let [rows (panes/panes (h-of params) {:provider provider
+                                           :include-goal? (bool (:include_goal params) false)})]
+        (r/ok {:count (count rows)
+               :panes (mapv row-view rows)})))))
 
 (defn- compact-opts [params h]
   (cond-> {:host h}
@@ -87,7 +96,7 @@
   (compact/start! ref (assoc opts :kind kind :on-end watch/job-ended!)))
 
 (defn- resolve-one [h ref]
-  (some #(when (some #{ref} (refs-of %)) %) (panes/panes h)))
+  (some #(when (some #{ref} (refs-of %)) %) (panes/panes h {:provider :all})))
 
 (defn caller-pid
   "The pid in a `coordinator:<pid>` caller id (the host stamps it on every call
@@ -117,6 +126,8 @@
   "pane given: compact those panes, whatever their size.
    pane omitted: every Claude pane over threshold, except those in exclude.
    dry_run: say what would be compacted, start nothing.
+   Only Claude panes compact: an explicit selection holding a pane without
+   the :compact capability (e.g. Codex) starts no job.
    The caller's own pane (`_caller_id`) is never compacted here: named, the
    call is refused at once; in a sweep it is left out and reported, both
    pointing at `swarm steer self` (see `self-compact`)."
@@ -125,23 +136,30 @@
         opts (compact-opts params h)
         threshold (or (:threshold opts) (:threshold compact/defaults))
         exclude (set (as-list (:exclude params)))
-        rows (panes/panes h)
+        rows (panes/panes h {:provider :all})
         refs (as-list (:pane params))
         me (caller-pid (:_caller_id params))
         matched (if refs
                   (keep (fn [ref] (some #(when (some #{ref} (refs-of %)) %) rows)) refs)
-                  (filter #(and (not (some exclude (refs-of %))) (compact/due? % threshold)) rows))
+                  (filter #(and (= :claude (:provider %))
+                                (not (some exclude (refs-of %)))
+                                (compact/due? % threshold)) rows))
         own (into [] (comp (filter #(own-pane? % me)) (distinct)) matched)
         own-view (when (seq own)
                    (assoc self-compact :own-pane (mapv #(select-keys % [:pane :name :ctx-tokens :goal-active?]) own)))
         targets (remove #(own-pane? % me) matched)
-        plan (mapv #(select-keys % [:pane :target :name :ctx-tokens :busy? :goal-active?]) targets)]
+        unsupported (filterv #(not (contains? (:capabilities %) :compact)) targets)
+        plan (mapv #(select-keys % [:pane :target :name :provider :ctx-tokens :busy? :goal-active?]) targets)]
     (cond
       (and refs (empty? matched))
-      (r/err :tmux/no-such-pane {:pane refs :known (mapv :name rows)})
+      (r/err :tmux/no-such-pane {:pane refs :known (mapv #(or (:name %) (:pane %)) rows)})
 
       (and refs (seq own))
       (r/err :tmux/own-pane own-view)
+
+      (seq unsupported)
+      (r/err :tmux/unsupported-provider {:panes (mapv #(select-keys % [:pane :provider :capabilities]) unsupported)
+                                        :command :compact})
 
       (bool (:dry_run params) false)
       (r/ok (cond-> {:dry-run true :threshold threshold :would-compact plan}
@@ -164,14 +182,18 @@
 (def ^:private pane-hint "pane=<%id|1:2.1|name|session-id>")
 
 (defn goal-cmd
-  "Arm or replace a pane's /goal without compacting it."
+  "Arm or replace a supported pane's /goal without compacting it."
   [params]
   (let [h (h-of params)
-        ref (:pane params)]
+        ref (:pane params)
+        row (when-not (str/blank? (str ref)) (resolve-one h ref))]
     (cond
       (str/blank? (str ref)) (r/err :tmux/no-pane {:hint pane-hint})
       (not (or (:goal params) (:goal_append params))) (r/err :tmux/no-goal {:hint "goal=<text> or goal_append=<text>"})
-      (nil? (resolve-one h ref)) (r/err :tmux/no-such-pane {:pane ref})
+      (nil? row) (r/err :tmux/no-such-pane {:pane ref})
+      (not (contains? (:capabilities row) :goal))
+      (r/err :tmux/unsupported-provider {:pane ref :provider (:provider row) :command :goal
+                                        :capabilities (:capabilities row)})
       :else (r/ok (start-job! ref :goal
                               (cond-> {:host h}
                                 (:goal params) (assoc :goal (str (:goal params)))
@@ -180,20 +202,24 @@
                                 (some? (:input_timeout_ms params)) (assoc :input-timeout-ms (int-param (:input_timeout_ms params) nil))))))))
 
 (defn say-cmd
-  "Submit one prompt to a pane."
+  "Submit one prompt to a pane with a tested input contract."
   [params]
   (let [h (h-of params)
         ref (:pane params)
-        text (some-> (:text params) str str/trim not-empty)]
+        text (some-> (:text params) str str/trim not-empty)
+        row (when-not (str/blank? (str ref)) (resolve-one h ref))]
     (cond
       (str/blank? (str ref)) (r/err :tmux/no-pane {:hint pane-hint})
       (nil? text) (r/err :tmux/no-text {:hint "text=<prompt>"})
-      (nil? (resolve-one h ref)) (r/err :tmux/no-such-pane {:pane ref})
+      (nil? row) (r/err :tmux/no-such-pane {:pane ref})
+      (not (contains? (:capabilities row) :say))
+      (r/err :tmux/unsupported-provider {:pane ref :provider (:provider row) :command :say
+                                        :capabilities (:capabilities row)})
       :else (r/ok (start-job! ref :say {:host h :text text
                                         :wait-idle? (bool (:wait_idle params) true)})))))
 
 (defn read-cmd
-  "A pane's newest assistant message (from its transcript) and its screen body."
+  "Read a terminal screen. Claude panes can also return transcript text."
   [params]
   (let [h (h-of params)
         ref (:pane params)
@@ -202,12 +228,17 @@
     (if-not row
       (r/err :tmux/no-such-pane {:pane ref :hint pane-hint})
       (let [lines (or (panes/capture h (:pane row) (+ n 30)) [])
-            transcript (when (:session-id row) ((:transcript h) (:cwd row) (:session-id row)))]
-        (r/ok (cond-> {:pane (:pane row) :name (:name row) :busy? (:busy? row)
-                       :goal-active? (:goal-active? row) :goal-ended? (:goal-ended? row)
-                       :screen (if (bool (:strip_chrome params) true)
+            claude? (= :claude (:provider row))
+            transcript (when (and claude? (:session-id row))
+                         ((:transcript h) (:cwd row) (:session-id row)))]
+        (r/ok (cond-> {:pane (:pane row) :provider (:provider row)
+                       :status (:status row) :capabilities (:capabilities row)
+                       :screen (if (and claude? (bool (:strip_chrome params) true))
                                  (screen/body lines n)
                                  (mapv screen/strip-ansi (take-last n lines)))}
+                claude? (assoc :name (:name row) :busy? (:busy? row)
+                               :goal-active? (:goal-active? row) :goal-ended? (:goal-ended? row))
+                (not claude?) (assoc :title (:title row) :screen-format :terminal)
                 (and transcript (bool (:last_assistant params) true))
                 (assoc :last-assistant (panes/last-assistant-text transcript))))))))
 
@@ -226,8 +257,8 @@
 
 (def subcommands
   {"panes"   {:fn panes-cmd
-              :doc "Every Claude Code pane as data: pane, target, name, session-id, cwd, ctx-tokens, busy?, status, goal-active?, goal-age, activity, input (text typed at the prompt) and suggestion (Claude Code's dimmed ghost text there, typed by no one; never relay it as the owner's words). include_goal=true adds the /goal text."
-              :params [:include_goal :socket_name]}
+              :doc "Claude Code and Codex panes as data with provider and capabilities. pane_provider=all (default), claude or codex. Claude rows include session, context, busy/input and optional goal facts; Codex rows expose terminal identity with status unknown and read-screen capability only. Titles do not identify a Codex task. include_goal=true reads Claude goals."
+              :params [:pane_provider :include_goal :socket_name]}
    "compact" {:fn compact-cmd
               :doc "Wait for rest, capture the /goal, send /compact, re-seed (default \"hive workflow catchup /caveman\"), restore the goal. pane=<ref,...> compacts those panes whatever their size; no pane = every pane over threshold (default 400000) minus exclude. Rest is a settled idle, except on a pane whose /goal is active: a /goal Stop hook restarts the next turn within a poll, so there the job reads the single turn boundary between turns (between_turns=auto, the default; true forces it, false forces the settled idle). Text someone left at a prompt is waited out up to input_timeout_ms (default 600000), never typed over; the job shows it under :waiting-on. Your OWN pane is refused (a sweep leaves it out): compact yourself with `swarm steer self input=/compact then=<reseed> dry_run=false`. Background job; returns job ids."
               :params [:pane :threshold :reseed :restore_goal :goal :goal_append :instructions :exclude :force :dry_run :input_timeout_ms :between_turns :socket_name]}
@@ -238,7 +269,7 @@
               :doc "Submit one prompt (text=) to a pane. Waits for a settled idle unless wait_idle=false; refuses (skipped, pending-human-input) when the prompt line holds text. Job is done once the pane starts on it; read the answer later with `tmux read`."
               :params [:pane :text :wait_idle :socket_name]}
    "read"    {:fn read-cmd
-              :doc "A pane's newest assistant message from its transcript (last_assistant, default true) and its last N screen lines (lines, default 40) without the status bar, spinner, tip and rules (strip_chrome, default true)."
+              :doc "Read a Claude or Codex pane's last N screen lines (lines, default 40). Claude may include transcript last_assistant and strip_chrome (both default true). Codex returns terminal text without Claude parsing, transcript attribution or inferred busy/input state."
               :params [:pane :lines :strip_chrome :last_assistant :socket_name]}
    "watch start" {:fn watch-start-cmd
                   :doc "Watch every Claude pane server-side and shout changes to parent=<agent id> as sixth-sense senses: pane-idle, goal-ended, context-high (threshold, default 400000) and tmux-job (a compact|say|goal job ended). Then `swarm ss wait` instead of polling. interval_ms default 5000; exclude=<refs> (your own pane)."
@@ -285,12 +316,13 @@
 
 (def contributions
   {subdomain {:handler dispatch-subdomain
-              :description (str "Claude Code panes in tmux, for a supervisor: "
+              :description (str "Claude Code and Codex pane discovery in tmux, with Claude supervision: "
                                 (str/join ", " (sort (keys subcommands)))
                                 ". Pane state as data and compaction that re-seeds and restores the /goal.")}})
 
 (def schema-ext
-  {"pane"         {:type "string" :description "[tmux compact] Pane ref(s), comma-separated: %3, 1:3.1, a session name or session id. Omit to sweep every pane over threshold."}
+  {"pane_provider" {:type "string" :enum ["all" "claude" "codex"] :description "[tmux panes] Provider inventory filter (default all); independent of the model provider parameter."}
+   "pane"         {:type "string" :description "[tmux compact] Pane ref(s), comma-separated: %3, 1:3.1, a session name or session id. Omit to sweep every pane over threshold."}
    "threshold"    {:type "integer" :description "[tmux compact] Context tokens at or above which a pane is compacted (default 400000)."}
    "reseed"       {:type "string" :description "[tmux compact] Prompt sent after /compact (default \"hive workflow catchup /caveman\"; empty string sends none)."}
    "restore_goal" {:type "boolean" :description "[tmux compact] Re-send the pane's /goal after the re-seed (default true)."}
