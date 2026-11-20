@@ -66,6 +66,17 @@
   (is (= "caveman catchup trigger" (screen/title-name "✳ caveman catchup trigger")))
   (is (= "OC | Processing" (screen/title-name "OC | Processing"))))
 
+(deftest title-name-ignores-status-and-effort-badges
+  (doseq [title ["caveman workflow catchup"
+                 "✳ caveman workflow catchup"
+                 "✶ caveman workflow catchup"
+                 "⠋ caveman workflow catchup"
+                 "◉ caveman workflow catchup"
+                 "◉ xhigh · /effort  caveman workflow catchup"
+                 "✶ high · /effort  caveman workflow catchup"]]
+    (is (= "caveman workflow catchup" (screen/title-name title)) title))
+  (is (nil? (screen/title-name "◉ xhigh · /effort  "))))
+
 (deftest the-prompt-line-reports-pending-input
   (is (nil? (:input (screen/read-screen busy-screen))) "an empty prompt has no input")
   (is (= "hive workflow catchup /caveman"
