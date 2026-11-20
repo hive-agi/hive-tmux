@@ -87,7 +87,8 @@
     (:goal_append params) (assoc :goal-append (str (:goal_append params)))
     (some? (:input_timeout_ms params)) (assoc :input-timeout-ms (int-param (:input_timeout_ms params) nil))
     (some? (:between_turns params)) (assoc :between-turns? (between-turns-param (:between_turns params)))
-    (bool (:force params) false) (assoc :force? true)))
+    (bool (:force params) false) (assoc :force? true)
+    (bool (:supersede params) false) (assoc :supersede? true)))
 
 (defn- start-job!
   "Every job this subdomain starts reports its end to the pane watcher, which
@@ -215,6 +216,7 @@
                                 (:goal params) (assoc :goal (str (:goal params)))
                                 (:goal_append params) (assoc :goal-append (str (:goal_append params)))
                                 (some? (:wait_idle params)) (assoc :wait-idle? (bool (:wait_idle params) true))
+                                (bool (:supersede params) false) (assoc :supersede? true)
                                 (some? (:input_timeout_ms params)) (assoc :input-timeout-ms (int-param (:input_timeout_ms params) nil))))))))
 
 (defn say-cmd
@@ -231,8 +233,9 @@
       (not (contains? (:capabilities row) :say))
       (r/err :tmux/unsupported-provider {:pane ref :provider (:provider row) :command :say
                                         :capabilities (:capabilities row)})
-      :else (r/ok (start-job! ref :say {:host h :text text
-                                        :wait-idle? (bool (:wait_idle params) true)})))))
+      :else (r/ok (start-job! ref :say (cond-> {:host h :text text
+                                                :wait-idle? (bool (:wait_idle params) true)}
+                                         (bool (:supersede params) false) (assoc :supersede? true)))))))
 
 (defn read-cmd
   "Read a terminal screen. Claude panes can also return transcript text."
@@ -277,13 +280,13 @@
               :params [:pane_provider :include_goal :socket_name]}
    "compact" {:fn compact-cmd
               :doc "Wait for rest, capture the /goal, send /compact, re-seed (default \"hive workflow catchup /caveman\"), restore the goal. pane=<ref,...> compacts those panes whatever their size; no pane = every pane over threshold (default 400000) minus exclude. Rest is a settled idle, except on a pane whose /goal is active: a /goal Stop hook restarts the next turn within a poll, so there the job reads the single turn boundary between turns (between_turns=auto, the default; true forces it, false forces the settled idle). Text someone left at a prompt is waited out up to input_timeout_ms (default 600000), never typed over; the job shows it under :waiting-on. Your OWN pane is refused (a sweep leaves it out): compact yourself with `swarm steer self input=/compact then=<reseed> dry_run=false`. Background job; returns job ids."
-              :params [:pane :threshold :reseed :restore_goal :goal :goal_append :instructions :exclude :force :dry_run :input_timeout_ms :between_turns :socket_name]}
+              :params [:pane :threshold :reseed :restore_goal :goal :goal_append :instructions :exclude :force :dry_run :input_timeout_ms :between_turns :supersede :socket_name]}
    "goal"    {:fn goal-cmd
               :doc "Arm or replace a pane's /goal WITHOUT compacting: goal=<text> replaces, goal_append=<text> extends the active one. Waits for a settled idle (wait_idle=false: skip a busy pane); text at the prompt is waited out up to input_timeout_ms (not with wait_idle=false), then stops it. Background job; job ends with goal-active-after?."
-              :params [:pane :goal :goal_append :wait_idle :input_timeout_ms :socket_name]}
+              :params [:pane :goal :goal_append :wait_idle :input_timeout_ms :supersede :socket_name]}
    "say"     {:fn say-cmd
               :doc "Submit one prompt (text=) to a pane. Waits for a settled idle unless wait_idle=false; refuses (skipped, pending-human-input) when the prompt line holds text. Job is done once the pane starts on it; read the answer later with `tmux read`."
-              :params [:pane :text :wait_idle :socket_name]}
+              :params [:pane :text :wait_idle :supersede :socket_name]}
    "read"    {:fn read-cmd
               :doc "Read a Claude or Codex pane's last N screen lines (lines, default 40). Claude may include transcript last_assistant and strip_chrome (both default true). Codex returns terminal text without Claude parsing, transcript attribution or inferred busy/input state."
               :params [:pane :lines :strip_chrome :last_assistant :socket_name]}
@@ -359,7 +362,8 @@
    "last_assistant" {:type "boolean" :description "[tmux read] Include the newest assistant message from the transcript (default true)."}
    "interval_ms"  {:type "integer" :description "[tmux watch start] Tick interval (default 5000)."}
    "job_id"       {:type "string" :description "[tmux job] Compaction job id from tmux compact."}
-   "cancel"       {:type "boolean" :description "[tmux job] With job_id: cancel that job if it has not typed into the pane yet."}})
+   "cancel"       {:type "boolean" :description "[tmux job] With job_id: cancel that job if it has not typed into the pane yet."}
+   "supersede"    {:type "boolean" :description "[tmux compact|say|goal] Cancel the pane's queued job if it has not typed yet and take its slot (default false: refuse :already-running naming it)."}})
 
 
 (def addon-key

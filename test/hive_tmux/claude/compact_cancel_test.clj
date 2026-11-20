@@ -106,3 +106,63 @@
     (is (= :tmux/already-typed (:error r)))
     (is (= :say (:step r)))
     (is (re-find #"already typed its say step" (:hint r)))))
+
+;;; Supersede
+
+(def ^:private long-text (apply str "wrap now: " (repeat 20 "0123456789")))
+
+(deftest blocking-view-names-the-job-its-kind-and-80-chars
+  (let [v (compact/blocking-view {:job-id "cc-1" :kind :say :status :running :opts {:text long-text}})]
+    (is (= {:job-id "cc-1" :kind :say :status :running :text (subs long-text 0 80)} v)))
+  (is (= "/goal ship it" (:text (compact/blocking-view {:kind :goal :opts {:goal "ship it"}}))))
+  (is (= "/compact keep the plan" (:text (compact/blocking-view {:kind :compact :opts {:instructions "keep the plan"}}))))
+  (is (= :say (:typed-step (compact/blocking-view {:kind :say :typed-step :say :opts {:text "x"}})))))
+
+(deftest without-supersede-the-refusal-names-the-blocker
+  (let [{:keys [host]} (held-busy-host)
+        a (compact/start! "%9" {:host host :kind :say :text long-text :poll-ms 1 :settle-ms 1})
+        b (compact/start! "%9" {:host host :kind :compact :poll-ms 1 :settle-ms 1})]
+    (try
+      (is (= :already-running (:error b)))
+      (is (= {:job-id (:job-id a) :kind :say :text (subs long-text 0 80)}
+             (select-keys (:blocking b) [:job-id :kind :text])))
+      (is (re-find #"supersede=true" (:hint b)))
+      (finally (compact/cancel! (:job-id a))))))
+
+(deftest supersede-cancels-an-untyped-job-and-takes-the-slot
+  (let [{:keys [state host]} (held-busy-host)
+        ended (atom [])
+        a (compact/start! "%9" {:host host :kind :say :text "stale" :poll-ms 1 :settle-ms 1
+                                :on-end #(swap! ended conj %)})]
+    (await-job (:job-id a) #(seq (:steps %)))
+    (binding [host/*host* host]
+      (doseq [[verb extra] [["compact" {:pane "%9"}] ["say" {:pane "%9" :text "new"}] ["goal" {:pane "%9" :goal "g"}]]]
+        (testing verb
+          (let [blocker (or (first (filter #(#{:queued :running} (:status %)) (compact/jobs))) a)
+                r (registry/dispatch (merge {:command verb :supersede "true"} extra))
+                started (or (first (get-in r [:ok :started])) (:ok r))]
+            (is (nil? (:error started)) (pr-str r))
+            (is (= (:job-id blocker) (:superseded started)))
+            (is (= :cancelled (:status (compact/job (:job-id blocker)))))
+            (is (= :superseded (:reason (compact/job (:job-id blocker)))))))))
+    (is (= [:cancelled] (mapv :status @ended)) "the superseded job fired its sense once")
+    (doseq [j (compact/jobs) :when (#{:queued :running} (:status j))] (compact/cancel! (:job-id j)))
+    (is (empty? (:sent @state)))))
+
+(deftest supersede-never-cancels-a-job-that-typed
+  (let [{:keys [state host]} (held-busy-host)
+        a (compact/start! "%9" {:host host :kind :say :text "typing" :poll-ms 1 :settle-ms 1})]
+    (await-job (:job-id a) #(seq (:steps %)))
+    ;; The job's first keystroke, claimed the way `deliver!` claims it.
+    (swap! (get @@#'compact/registry (:job-id a)) compact/claim-typing :say)
+    (let [jobs-before (count (compact/jobs))
+          r (compact/start! "%9" {:host host :kind :compact :supersede? true :poll-ms 1 :settle-ms 1})]
+      (is (= :already-typed (:error r)))
+      (is (= :say (:step r)))
+      (is (= (:job-id a) (get-in r [:blocking :job-id])))
+      (is (= jobs-before (count (compact/jobs))) "nothing was started")
+      (is (#{:queued :running} (:status (compact/job (:job-id a))))))
+    ;; Teardown: take the fake keystroke back so the held runner can be cancelled and stop.
+    (swap! (get @@#'compact/registry (:job-id a)) dissoc :typed-step)
+    (compact/cancel! (:job-id a))
+    (is (empty? (:sent @state)))))

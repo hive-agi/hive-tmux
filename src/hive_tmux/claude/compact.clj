@@ -134,6 +134,25 @@
   [job]
   (or (not (contains? job :cancelled-at)) (cancelled? job)))
 
+(defn job-text
+  "The text JOB would type, as a supervisor reads it: the prompt of a say,
+   the /goal of a goal, the /compact (with instructions) of a compaction."
+  [{:keys [kind opts]}]
+  (case kind
+    :say (str (:text opts))
+    :goal (str "/goal " (or (:goal opts) (:goal-append opts)))
+    (str "/compact" (some->> (:instructions opts) str/trim not-empty (str " ")))))
+
+(defn blocking-view
+  "What an :already-running refusal says of the BLOCKING job value: its id,
+   kind, status, the first 80 characters of its text, and the step that
+   typed, if one did."
+  [job]
+  (let [text (job-text job)]
+    (cond-> {:job-id (:job-id job) :kind (:kind job :compact) :status (:status job)
+             :text (subs text 0 (min 80 (count text)))}
+      (:typed-step job) (assoc :typed-step (:typed-step job)))))
+
 ;;; Pipeline
 
 (defn- step! [state k data]
@@ -444,24 +463,43 @@
 
    A job cancelled (`cancel!`) before its first keystroke ends :cancelled:
    its state refuses any later status (`job-consistent?`), its runner stops at
-   its next wait (`cancellable-host`), and :on-end runs once, from `cancel!`."
-  [ref {:keys [sync? on-end] :as opts}]
+   its next wait (`cancellable-host`), and :on-end runs once, from `cancel!`.
+
+   :already-running names the blocking job (`blocking-view`) and hints
+   supersede. OPTS :supersede? true cancels that job (reason :superseded) when
+   it has not typed, and takes the slot; one that typed refuses :already-typed
+   naming the step, and nothing is started."
+  [ref {:keys [sync? on-end supersede?] :as opts}]
   (let [h (or (:host opts) (host/host))
         kind (or (:kind opts) :compact)
         runner (get runners kind)
-        row (poll/observe h ref)]
+        row (poll/observe h ref)
+        blocking (when (and runner row) (active-for (:pane row)))
+        superseded (when (and blocking supersede?) (cancel! (:job-id blocking) :superseded))]
     (cond
       (nil? runner) {:error :unknown-kind :kind kind}
-      (and row (active-for (:pane row))) {:error :already-running :job (active-for (:pane row))}
+
+      (and blocking (not supersede?))
+      {:error :already-running :job blocking :blocking (blocking-view blocking)
+       :hint (str "Pane " (:pane row) " holds " (name (:kind blocking :compact)) " job " (:job-id blocking)
+                  ". supersede=true cancels it, if it has not typed yet, and takes the slot; or `swarm tmux job job_id="
+                  (:job-id blocking) " cancel=true`.")}
+
+      (= :already-typed (:refuse superseded))
+      {:error :already-typed :step (:step superseded) :blocking (blocking-view (:job superseded))
+       :hint (str "Job " (:job-id blocking) " already typed its " (name (:step superseded))
+                  " step into pane " (:pane row) "; it is not superseded. Wait for it to end.")}
+
       :else
-      (let [job (assoc (new-job ref (dissoc opts :on-end)) :kind kind)
+      (let [job (cond-> (assoc (new-job ref (dissoc opts :on-end :supersede?)) :kind kind)
+                  (:cancelled? superseded) (assoc :superseded (:job-id blocking)))
             state (atom (assoc job :pane (:pane row))
                         :meta {:on-end on-end}
                         :validator job-consistent?)
             follow (or (:pane row) ref)
             h (cancellable-host h state)]
         (swap! registry assoc (:job-id job) state)
-        (let [work #(try (runner h state follow (dissoc opts :host :sync? :kind :on-end))
+        (let [work #(try (runner h state follow (dissoc opts :host :sync? :kind :on-end :supersede?))
                          (catch Throwable t
                            (when-not (cancelled? @state)
                              (fail! state :threw {:message (.getMessage t)}))
