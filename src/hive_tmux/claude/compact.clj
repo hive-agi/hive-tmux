@@ -6,6 +6,14 @@
    The goal step exists because /compact clears an active /goal: a peer that
    is re-seeded with catchup alone finishes catchup, finds no task and stops.
 
+   WAITING FOR REST. A job must not type into a working turn, so every step
+   waits for rest first. A pane busy for ordinary reasons is read at a settled
+   idle (idle twice, :settle-ms apart); a pane under a /goal Stop hook is read
+   at its single turn boundary, because the hook restarts the next turn within
+   a poll and twice-in-a-row can never happen on it (friction 20261116185504:
+   30 min at :wait-idle, then 337k -> 469k tokens). `poll/wait-rest` is the one
+   waiter, so the choice holds across every step of a job.
+
    Strata:
      Promote   due? / ctx-drop / goal-after          pure
      Pipeline  compact! / say! / goal!               drive the steps through the host port
@@ -34,6 +42,10 @@
    :restore-goal? true
    :poll-ms 5000
    :settle-ms 10000
+   ;; How rest is proven: :auto reads a /goal-active pane at its single turn
+   ;; boundary and every other pane at a settled idle; true and false force
+   ;; one or the other (`between-turns?`).
+   :between-turns? :auto
    :idle-timeout-ms (* 30 60 1000)
    :step-timeout-ms (* 15 60 1000)
    :start-timeout-ms 60000
@@ -142,8 +154,8 @@
   (when (deliver! h state ref pane-id text step-key opts)
     ;; The turn may start and end between two polls; seeing busy is not required.
     (poll/wait-until h ref :busy? opts (:start-timeout-ms opts))
-    (or (poll/wait-settled-idle h ref opts (:step-timeout-ms opts))
-        (timeout! h state ref step-key {:waited-for :settled-idle}))))
+    (or (poll/wait-rest h ref poll/idle? opts (:step-timeout-ms opts))
+        (timeout! h state ref step-key {:waited-for (poll/waited-for opts)}))))
 
 (defn- send-and-start!
   "Send TEXT as a job's LAST step and end on the pane's acknowledgement: seen
@@ -192,7 +204,7 @@
               (swap! state assoc :compacted? true :compacted-by (:by evidence)
                      :tokens-after-compact (:tokens evidence))
               {:compacted evidence
-               :row (poll/wait-settled-idle h ref opts (:step-timeout-ms opts))}))))))
+               :row (poll/wait-rest h ref poll/idle? opts (:step-timeout-ms opts))}))))))
 
 (defn goal-after
   "The goal to set after the re-seed. GOAL (an override) wins over CAPTURED;
@@ -213,12 +225,18 @@
    never on a screen marker. A compaction proven while the pane then stays busy
    (someone else gave it work) is :done with :reason :pane-busy-after-compact
    and the texts it did not type under :unsent: the recycle worked, and typing
-   into a working pane is what this job never does."
+   into a working pane is what this job never does.
+
+   REST: see the namespace docstring. Nothing here lands on a running turn."
   [h state ref opts]
   (let [opts (merge defaults opts)
-        start (poll/observe h ref)]
+        start (poll/observe h ref)
+        ;; Proving rest is decided ONCE, from the pane as the job found it: the
+        ;; /goal that makes a Stop hook restart the next turn is what /compact
+        ;; clears, so asking later would flip the job's contract halfway.
+        opts (poll/with-turns opts start)]
     (swap! state assoc :status :running :pane (:pane start) :name (:name start)
-           :tokens-before (:ctx-tokens start))
+           :tokens-before (:ctx-tokens start) :between-turns? (:between-turns? opts))
     (cond
       (nil? start)
       (fail! state :no-such-pane {:ref ref})
@@ -229,8 +247,8 @@
       :else
       (let [pane-id (:pane start)]
         (when-let [ready (do (step! state :wait-idle {})
-                             (or (poll/wait-settled-idle h ref opts (:idle-timeout-ms opts))
-                                 (timeout! h state ref :wait-idle {:waited-for :settled-idle})))]
+                             (or (poll/wait-rest h ref poll/idle? opts (:idle-timeout-ms opts))
+                                 (timeout! h state ref :wait-idle {:waited-for (poll/waited-for opts)})))]
           (let [captured (when (and (:restore-goal? opts) (:goal-active? ready) (:session-id ready))
                            (panes/goal-text (or ((:transcript h) (:cwd ready) (:session-id ready)) [])))
                 goal (goal-after opts captured)
@@ -267,14 +285,15 @@
   "The pane's first row, waited to a settled idle when WAIT-IDLE? (else it
    must already be idle). Nil when it stopped (status is set)."
   [h state ref {:keys [wait-idle?] :as opts}]
-  (let [start (poll/observe h ref)]
+  (let [start (poll/observe h ref)
+        opts (poll/with-turns opts start)]
     (swap! state assoc :status :running :pane (:pane start) :name (:name start)
-           :tokens-before (:ctx-tokens start))
+           :tokens-before (:ctx-tokens start) :between-turns? (:between-turns? opts))
     (cond
       (nil? start) (fail! state :no-such-pane {:ref ref})
       wait-idle? (do (step! state :wait-idle {})
-                     (or (poll/wait-settled-idle h ref opts (:idle-timeout-ms opts))
-                         (timeout! h state ref :wait-idle {:waited-for :settled-idle})))
+                     (or (poll/wait-rest h ref poll/idle? opts (:idle-timeout-ms opts))
+                         (timeout! h state ref :wait-idle {:waited-for (poll/waited-for opts)})))
       (idle? start) start
       :else (do (swap! state assoc :status :skipped :reason :busy) nil))))
 

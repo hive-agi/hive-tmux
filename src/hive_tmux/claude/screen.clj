@@ -314,10 +314,13 @@
 
 (defn title-name
   "The session name in a tmux pane title such as \"✳ caveman skill load\": the
-   title minus its leading status glyphs. Nil for a blank title."
+   title minus its leading status glyphs and effort badge. Nil for a blank title."
   [title]
-  (let [t (str/trim (str title))]
-    (not-empty (str/trim (apply str (drop-while (complement word-char?) t))))))
+  (let [t (-> (str/trim (str title))
+              (str/replace #"^[^\p{L}\p{N}]+" "")
+              (str/replace #"^[^\s]+\s+·\s+/effort(?:\s+|$)" "")
+              str/trim)]
+    (not-empty t)))
 
 (defn- rule-line? [line]
   (let [t (utrim line)]

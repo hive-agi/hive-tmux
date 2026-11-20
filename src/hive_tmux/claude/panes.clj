@@ -26,12 +26,12 @@
 ;; SPDX-License-Identifier: MIT
 
 (def ^:private fields
-  [:pane :session :window :index :pid :command :cwd :title])
+  [:pane :session :window :index :pid :command :cwd :title :tty])
 
 (def ^:private list-format
   (str/join "\t" ["#{pane_id}" "#{session_name}" "#{window_index}" "#{pane_index}"
                   "#{pane_pid}" "#{pane_current_command}" "#{pane_current_path}"
-                  "#{pane_title}"]))
+                  "#{pane_title}" "#{pane_tty}"]))
 
 (defn- split-on
   "S split at every SEP (a string), keeping empty fields."
@@ -129,8 +129,14 @@
 (defn pane-row
   "One pane's row from its tmux PANE map, its SCREEN facts and SESSIONS."
   [pane facts sessions]
-  (let [name* (or (:footer-name facts) (screen/title-name (:title pane)))
-        {:keys [session ambiguous?]} (join-session sessions name* (:cwd pane))
+  (let [title-name (screen/title-name (:title pane))
+        names (distinct (remove nil? [(:footer-name facts) title-name]))
+        [name* joined] (or (some (fn [name]
+                                   (when-let [joined (join-session sessions name (:cwd pane))]
+                                     [name joined]))
+                                 names)
+                           [(first names) nil])
+        {:keys [session ambiguous?]} joined
         status (some-> (:status session) keyword)]
     (cond-> {:pane (:pane pane)
              :target (:target pane)
@@ -149,7 +155,8 @@
              :activity (:activity facts)
              :vim-mode (:vim-mode facts)
              :input (:input facts)
-             :suggestion (:suggestion facts)}
+             :suggestion (:suggestion facts)
+             :tty (not-empty (:tty pane))}
       ambiguous? (assoc :ambiguous? true)
       (nil? session) (assoc :unjoined? true))))
 
@@ -182,23 +189,50 @@
     (or (= "claude" c)
         (and (seq c) (every? #(or (Character/isDigit ^char %) (= \. %)) c)))))
 
+(defn codex-pane?
+  "Is the pane's foreground command Codex? Titles are not identity evidence."
+  [{:keys [command]}]
+  (= "codex" command))
+
+(defn- codex-row
+  "Read-only terminal identity. Codex state is not inferred from Claude files."
+  [pane]
+  (assoc (select-keys pane [:pane :target :cwd :title :command])
+         :pane-pid (:pid pane)
+         :provider :codex
+         :status :unknown
+         :capabilities #{:read-screen}
+         :unjoined? true))
+
 ;;; Boundary
 
 (defn panes
-  "Every Claude Code pane as a row. OPTS:
-     :include-goal?  also read each goal-active pane's transcript for :goal
-     :lines          screen lines to read (default 40)"
+  "Assistant panes as rows. OPTS:
+     :provider       :claude (default), :codex or :all
+     :include-goal?  read Claude goal-active transcripts for :goal
+     :lines          Claude screen lines to read (default 40).
+   Automation callers retain the Claude-only default. Codex inventory does
+   not capture its screen or join it to Claude session files."
   ([] (panes (host/host) {}))
   ([h] (panes h {}))
-  ([h {:keys [include-goal? lines] :or {lines 40}}]
-   (let [sessions ((:sessions h))]
-     (->> (list-raw h)
-          (filter claude-pane?)
-          (mapv (fn [p]
-                  (let [row (pane-row p (screen/read-screen (or (capture h (:pane p) lines) [])) sessions)]
-                    (if (and include-goal? (:goal-active? row) (:session-id row))
-                      (assoc row :goal (goal-text (or ((:transcript h) (:cwd row) (:session-id row)) [])))
-                      row))))))))
+  ([h {:keys [include-goal? lines provider] :or {lines 40 provider :claude}}]
+   (when-not (#{:claude :codex :all} provider)
+     (throw (ex-info "Unsupported pane provider" {:provider provider})))
+   (let [raw (filterv (fn [p]
+                       (or (and (#{:claude :all} provider) (claude-pane? p))
+                           (and (#{:codex :all} provider) (codex-pane? p))))
+                     (list-raw h))
+         sessions (when (some claude-pane? raw) ((:sessions h)))]
+     (mapv (fn [p]
+             (if (codex-pane? p)
+               (codex-row p)
+               (let [row (assoc (pane-row p (screen/read-screen (or (capture h (:pane p) lines) [])) sessions)
+                                :provider :claude
+                                :capabilities #{:read-screen :say :compact :goal})]
+                 (if (and include-goal? (:goal-active? row) (:session-id row))
+                   (assoc row :goal (goal-text (or ((:transcript h) (:cwd row) (:session-id row)) [])))
+                   row))))
+           raw))))
 
 (defn pane
   "The row of the pane REF names: a pane id (%3), a target (1:3.1), a session
