@@ -92,6 +92,48 @@
   (when (and (some? before-count) (> (count boundaries) before-count))
     {:by :compact-boundary :tokens (:post-tokens (peek boundaries))}))
 
+(defn cancelled?
+  "Has JOB been cancelled? Terminal: nothing the job's runner writes after
+   it may change its status (`new-state` enforces it)."
+  [job]
+  (= :cancelled (:status job)))
+
+(defn cancel-verdict
+  "May JOB (a job value) be cancelled now? {:cancel? true}, or a refusal:
+   :already-typed with the :step that typed first (a keystroke reached the
+   pane, so cancelling would leave half a command there), :already-cancelled,
+   or :not-active with the job's :status (it ended on its own)."
+  [job]
+  (cond (cancelled? job) {:refuse :already-cancelled}
+        (:typed-step job) {:refuse :already-typed :step (:typed-step job)}
+        (not (#{:queued :running} (:status job))) {:refuse :not-active :status (:status job)}
+        :else {:cancel? true}))
+
+(defn cancel-job
+  "JOB cancelled at NOW-MS for REASON, when `cancel-verdict` allows it; JOB
+   unchanged otherwise."
+  [job reason now-ms]
+  (if (:cancel? (cancel-verdict job))
+    (assoc job :status :cancelled :reason reason :cancelled-at now-ms :ended-at now-ms)
+    job))
+
+(defn claim-typing
+  "JOB about to type its STEP-KEY step: records the first step that types
+   (:typed-step), after which `cancel-verdict` refuses. A cancelled JOB is
+   returned unchanged, and must not type."
+  [job step-key]
+  (cond (cancelled? job) job
+        (:typed-step job) job
+        :else (assoc job :typed-step step-key)))
+
+(defn job-consistent?
+  "The job invariant a job's state atom validates: once cancelled (it carries
+   :cancelled-at), a job stays :cancelled. A runner still waiting when its job
+   was cancelled therefore cannot write a later status over it: the write is
+   refused and the runner stops there."
+  [job]
+  (or (not (contains? job :cancelled-at)) (cancelled? job)))
+
 ;;; Pipeline
 
 (defn- step! [state k data]
@@ -118,7 +160,9 @@
    Still there, the job stops :skipped :pending-human-input naming the pane
    and the text; a pane that stayed busy stops it :skipped :busy. A slash
    command the composer does not hold back stops it :failed
-   :composer-mismatch with Enter unpressed (`composer/send-text!`)."
+   :composer-mismatch with Enter unpressed (`composer/send-text!`).
+   The first keystroke is claimed on STATE (`claim-typing`) in the same swap
+   a cancel would make, so a job cancelled before it types never types."
   [h state ref pane-id text step-key opts]
   (let [row0 (poll/observe h ref)
         free? (and (poll/idle? row0) (nil? (:input row0)))
@@ -129,7 +173,10 @@
                                      (swap! state assoc :waiting-on (assoc on :during step-key))
                                      (try (poll/wait-input-clear h ref opts wait-ms)
                                           (finally (swap! state dissoc :waiting-on)))))]
-    (if-not row
+    (cond
+      (cancelled? @state) false
+
+      (not row)
       (let [end (or (poll/observe h ref) row0)
             input (or (:input end) (:input row0))]
         (swap! state assoc :status :skipped :reason (if input :pending-human-input :busy)
@@ -139,6 +186,10 @@
                                      :hint (str "Text stands at the prompt of " pane-id " and was not typed over. "
                                                 "Send or clear it, then start the job again."))))
         false)
+
+      (cancelled? (swap! state claim-typing step-key)) false
+
+      :else
       (let [{:keys [submitted? composer]} (composer/send-text! h pane-id text (:vim-mode row))]
         (if submitted?
           (do (step! state step-key {:sent text}) true)
@@ -349,10 +400,38 @@
                         v)))
         @registry))
 
+(defn cancel!
+  "Cancel JOB-ID for REASON (:cancelled by default) if it has not typed yet
+   (`cancel-verdict`, decided inside the swap, so it cannot race the job's
+   first keystroke). The job ends :cancelled, which frees its pane's slot,
+   and its :on-end runs once with the cancelled job (the tmux-job sense).
+   {:cancelled? true :job job}, or {:cancelled? false :refuse kw ...} naming
+   why, e.g. :already-typed with the :step; nil when there is no such job."
+  ([job-id] (cancel! job-id :cancelled))
+  ([job-id reason]
+   (when-let [state (get @registry job-id)]
+     (let [[before after] (swap-vals! state cancel-job reason (System/currentTimeMillis))]
+       (if (and (not (cancelled? before)) (cancelled? after))
+         (let [on-end (:on-end (meta state))]
+           (when on-end (guard Exception nil (on-end after)))
+           {:cancelled? true :job after})
+         (merge {:cancelled? false :job (dissoc before :steps)} (cancel-verdict before)))))))
+
 (def ^:private runners
   {:compact #'compact!
    :say #'say!
    :goal #'goal!})
+
+(defn- cancellable-host
+  "H whose :sleep! ends the runner of STATE once its job is cancelled, so a
+   cancelled job stops at its next wait instead of polling the pane for up to
+   :idle-timeout-ms. Every wait sleeps through the host port, so this is the
+   one seam a runner needs."
+  [{:keys [sleep!] :as h} state]
+  (assoc h :sleep! (fn [ms]
+                     (when (cancelled? @state)
+                       (throw (ex-info "job cancelled" {:type ::cancelled :job-id (:job-id @state)})))
+                     (sleep! ms))))
 
 (defn start!
   "Start a background job on the pane REF names. OPTS :kind is :compact
@@ -361,7 +440,11 @@
    id, which /compact does not change. OPTS :on-end, a fn of the final job
    map, runs once when the job ends (how the watcher turns it into a sense).
    Pass :host in OPTS to use another port (tests); :sync? true runs in the
-   caller."
+   caller.
+
+   A job cancelled (`cancel!`) before its first keystroke ends :cancelled:
+   its state refuses any later status (`job-consistent?`), its runner stops at
+   its next wait (`cancellable-host`), and :on-end runs once, from `cancel!`."
   [ref {:keys [sync? on-end] :as opts}]
   (let [h (or (:host opts) (host/host))
         kind (or (:kind opts) :compact)
@@ -372,16 +455,22 @@
       (and row (active-for (:pane row))) {:error :already-running :job (active-for (:pane row))}
       :else
       (let [job (assoc (new-job ref (dissoc opts :on-end)) :kind kind)
-            state (atom (assoc job :pane (:pane row)))
-            follow (or (:pane row) ref)]
+            state (atom (assoc job :pane (:pane row))
+                        :meta {:on-end on-end}
+                        :validator job-consistent?)
+            follow (or (:pane row) ref)
+            h (cancellable-host h state)]
         (swap! registry assoc (:job-id job) state)
         (let [work #(try (runner h state follow (dissoc opts :host :sync? :kind :on-end))
                          (catch Throwable t
-                           (fail! state :threw {:message (.getMessage t)})
+                           (when-not (cancelled? @state)
+                             (fail! state :threw {:message (.getMessage t)}))
                            @state)
                          (finally
-                           (swap! state assoc :ended-at (System/currentTimeMillis))
-                           (when on-end (guard Exception nil (on-end @state)))))]
+                           ;; A cancelled job was ended, and announced, by `cancel!`.
+                           (when-not (cancelled? @state)
+                             (swap! state assoc :ended-at (System/currentTimeMillis))
+                             (when on-end (guard Exception nil (on-end @state))))))]
           (if sync?
             (work)
             (do (future (work)) @state)))))))

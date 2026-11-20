@@ -172,11 +172,27 @@
                      :hint "Poll with `swarm tmux job job_id=<id>`; status goes queued -> running -> done | skipped | failed."}
               own-view (assoc :skipped-own-pane own-view))))))
 
-(defn job-cmd [{:keys [job_id]}]
-  (if job_id
+(defn job-cmd [{:keys [job_id] :as params}]
+  (cond
+    (bool (:cancel params) false)
+    (if-not job_id
+      (r/err :tmux/no-job-id {:hint "job_id=<id> cancel=true"})
+      (let [{:keys [cancelled? refuse job] :as res} (compact/cancel! job_id)]
+        (cond
+          (nil? res) (r/err :tmux/no-such-job {:job_id job_id})
+          cancelled? (r/ok (dissoc job :steps))
+          :else (r/err (keyword "tmux" (name refuse))
+                       (cond-> (dissoc res :cancelled? :refuse)
+                         (= :already-typed refuse)
+                         (assoc :hint (str "Job " job_id " already typed its " (name (:step res))
+                                           " step into the pane; cancelling now would leave half a command there.")))))))
+
+    job_id
     (if-let [j (compact/job job_id)]
       (r/ok j)
       (r/err :tmux/no-such-job {:job_id job_id}))
+
+    :else
     (r/ok {:jobs (mapv #(dissoc % :steps) (compact/jobs))})))
 
 (def ^:private pane-hint "pane=<%id|1:2.1|name|session-id>")
@@ -277,8 +293,8 @@
    "watch stop"   {:fn watch-stop-cmd :doc "Stop the pane watcher." :params []}
    "watch status" {:fn watch-status-cmd :doc "The pane watcher: running?, parent, ticks, events fired per kind, last error." :params []}
    "job"     {:fn job-cmd
-              :doc "One compaction job by job_id with its steps, or every job without."
-              :params [:job_id]}})
+              :doc "One compaction job by job_id with its steps, or every job without. job_id=<id> cancel=true cancels a job that has not typed yet: it ends :cancelled, frees the pane's slot and fires a tmux-job sense; a job that typed refuses :already-typed, naming the step."
+              :params [:job_id :cancel]}})
 
 (defn normalize-command [command]
   (let [ws (tokens (str/lower-case (str/trim (str command))) " \t\n")]
@@ -342,7 +358,8 @@
    "strip_chrome" {:type "boolean" :description "[tmux read] Drop the status bar, spinner, tip and rules (default true)."}
    "last_assistant" {:type "boolean" :description "[tmux read] Include the newest assistant message from the transcript (default true)."}
    "interval_ms"  {:type "integer" :description "[tmux watch start] Tick interval (default 5000)."}
-   "job_id"       {:type "string" :description "[tmux job] Compaction job id from tmux compact."}})
+   "job_id"       {:type "string" :description "[tmux job] Compaction job id from tmux compact."}
+   "cancel"       {:type "boolean" :description "[tmux job] With job_id: cancel that job if it has not typed into the pane yet."}})
 
 
 (def addon-key
