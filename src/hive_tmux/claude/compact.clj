@@ -94,7 +94,8 @@
 
 (defn cancelled?
   "Has JOB been cancelled? Terminal: nothing the job's runner writes after
-   it may change its status (`new-state` enforces it)."
+   it may change its status (`job-consistent?`, the state atom's validator,
+   enforces it)."
   [job]
   (= :cancelled (:status job)))
 
@@ -152,6 +153,21 @@
     (cond-> {:job-id (:job-id job) :kind (:kind job :compact) :status (:status job)
              :text (subs text 0 (min 80 (count text)))}
       (:typed-step job) (assoc :typed-step (:typed-step job)))))
+
+(defn start-refusal
+  "Why a KIND job with OPTS would stop at once on the pane whose row is ROW,
+   without typing: {:reason kw ...}, or nil when it would go on to work.
+   The same cheap checks the runners make first (`compact!`, `start-row`,
+   `say!`), so a supersede cancels the blocking job only for a job that will
+   actually run."
+  [kind opts row]
+  (let [opts (merge defaults {:wait-idle? true} opts)]
+    (cond
+      (nil? row) {:reason :no-such-pane}
+      (and (= :say kind) (nil? (some-> (:text opts) str str/trim not-empty))) {:reason :no-text}
+      (and (= :compact kind) (not (:force? opts)) (not (due? row (:threshold opts))))
+      {:reason :under-threshold :ctx-tokens (:ctx-tokens row) :threshold (:threshold opts)}
+      (and (#{:say :goal} kind) (false? (:wait-idle? opts)) (not (idle? row))) {:reason :busy})))
 
 ;;; Pipeline
 
@@ -475,9 +491,16 @@
         runner (get runners kind)
         row (poll/observe h ref)
         blocking (when (and runner row) (active-for (:pane row)))
-        superseded (when (and blocking supersede?) (cancel! (:job-id blocking) :superseded))]
+        ;; Cheap pre-checks first: a supersede cancels only for a job that will run.
+        doomed (when (and blocking supersede?) (start-refusal kind (dissoc opts :host) row))
+        superseded (when (and blocking supersede? (not doomed)) (cancel! (:job-id blocking) :superseded))]
     (cond
       (nil? runner) {:error :unknown-kind :kind kind}
+
+      doomed
+      {:error :would-not-start :refusal doomed :blocking (blocking-view blocking)
+       :hint (str "The new " (name kind) " job would stop at once (" (name (:reason doomed)) "), so job "
+                  (:job-id blocking) " was not superseded.")}
 
       (and blocking (not supersede?))
       {:error :already-running :job blocking :blocking (blocking-view blocking)
