@@ -26,12 +26,12 @@
 ;; SPDX-License-Identifier: MIT
 
 (def ^:private fields
-  [:pane :session :window :index :pid :command :cwd :title])
+  [:pane :session :window :index :pid :command :cwd :title :tty])
 
 (def ^:private list-format
   (str/join "\t" ["#{pane_id}" "#{session_name}" "#{window_index}" "#{pane_index}"
                   "#{pane_pid}" "#{pane_current_command}" "#{pane_current_path}"
-                  "#{pane_title}"]))
+                  "#{pane_title}" "#{pane_tty}"]))
 
 (defn- split-on
   "S split at every SEP (a string), keeping empty fields."
@@ -129,8 +129,18 @@
 (defn pane-row
   "One pane's row from its tmux PANE map, its SCREEN facts and SESSIONS."
   [pane facts sessions]
-  (let [name* (or (:footer-name facts) (screen/title-name (:title pane)))
-        {:keys [session ambiguous?]} (join-session sessions name* (:cwd pane))
+  (let [title-name (screen/title-name (:title pane))
+        names (distinct (remove nil? [(:footer-name facts) title-name]))
+        [name* joined] (or (some (fn [name]
+                                   (when-let [joined (join-session sessions name (:cwd pane))]
+                                     [name joined]))
+                                 names)
+                           (some (fn [key]
+                                   (when-let [session (some #(when (= (key pane) (key %)) %) sessions)]
+                                     [(or (:name session) (first names)) {:session session}]))
+                                 [:tty :pid])
+                           [(first names) nil])
+        {:keys [session ambiguous?]} joined
         status (some-> (:status session) keyword)]
     (cond-> {:pane (:pane pane)
              :target (:target pane)
@@ -149,7 +159,8 @@
              :activity (:activity facts)
              :vim-mode (:vim-mode facts)
              :input (:input facts)
-             :suggestion (:suggestion facts)}
+             :suggestion (:suggestion facts)
+             :tty (not-empty (:tty pane))}
       ambiguous? (assoc :ambiguous? true)
       (nil? session) (assoc :unjoined? true))))
 
