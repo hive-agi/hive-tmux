@@ -53,13 +53,16 @@
     (let [row (panes/pane-row {:title "unrelated" :tty "/dev/pts/7"} {}
                               [(assoc session :tty "/dev/pts/7")])]
       (is (= "sid-1" (:session-id row)))))
-  (testing "pid"
-    (let [row (panes/pane-row {:title "unrelated" :pid "200"} {} [session])]
+  (testing "a numeric session pid equals the tmux string pid"
+    (let [row (panes/pane-row {:title "unrelated" :pid "1234"} {}
+                              [(assoc session :pid 1234)])]
       (is (= "sid-1" (:session-id row)))))
-  (testing "missing identities never equal one another"
-    (let [row (panes/pane-row {:title "unrelated" :tty "/dev/pts/7"} {}
-                              [(assoc session :name "other" :tty "/dev/pts/8")])]
-      (is (true? (:unjoined? row)))))
+  (testing "blank and missing identities never match absent session identities"
+    (doseq [pane [{:title "unrelated"}
+                  {:title "unrelated" :tty "" :pid ""}
+                  {:title "unrelated" :tty nil :pid nil}]]
+      (let [row (panes/pane-row pane {} [(assoc session :name "other" :pid nil)])]
+        (is (true? (:unjoined? row)) (pr-str pane)))))
   (testing "a name match is authoritative"
     (let [row (panes/pane-row {:title "✳ caveman workflow catchup" :cwd "/srv/peer"
                                :pid "200"}

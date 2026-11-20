@@ -136,8 +136,10 @@
                                      [name joined]))
                                  names)
                            (some (fn [key]
-                                   (when-let [session (some #(when (= (key pane) (key %)) %) sessions)]
-                                     [(or (:name session) (first names)) {:session session}]))
+                                   (let [identity (str (key pane))]
+                                     (when-not (str/blank? identity)
+                                       (when-let [session (some #(when (= identity (str (key %))) %) sessions)]
+                                         [(or (:name session) (first names)) {:session session}]))))
                                  [:tty :pid])
                            [(first names) nil])
         {:keys [session ambiguous?]} joined
