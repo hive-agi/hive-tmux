@@ -17,7 +17,8 @@
             [hive-addon.registry.commands :as addon-cmds]
             [hive-tmux.claude.watch :as watch]
             [hive-tmux.claude.screen :as screen]
-            [hive-tmux.claude.sense :as sense]))
+            [hive-tmux.claude.sense :as sense]
+            [clojure.data.json :as json]))
 
 ;; Copyright (C) 2026 Pedro Gomes Branquinho (BuddhiLW) <pedrogbranquinho@gmail.com>
 ;;
@@ -29,10 +30,29 @@
 (defn- tokens [s delims]
   (enumeration-seq (java.util.StringTokenizer. (str s) delims)))
 
-(defn- as-list [x]
-  (cond (nil? x) nil
-        (string? x) (seq (remove str/blank? (map str/trim (tokens x ","))))
-        :else (seq x)))
+(defn pane-refs
+  "The one normalizer for every pane-ref list parameter (pane, exclude): a
+   vector of trimmed, non-blank ref strings, or nil when there are none.
+   Accepted: a JSON array (as data, or as its text, which is how a host may
+   hand over exclude=[\"%9\"]), a comma-separated string, or one ref. A
+   bracketed text that is not a JSON array of strings is refused (thrown, so
+   the dispatcher reports it), never read as a ref: excluding nothing because
+   of a stray bracket is the bug this exists to stop."
+  [x]
+  (let [clean (fn [xs] (not-empty (into [] (comp (map #(str/trim (str %))) (remove str/blank?)) xs)))]
+    (cond
+      (nil? x) nil
+      (sequential? x) (clean x)
+      (set? x) (clean (sort x))
+      :else
+      (let [s (str/trim (str x))]
+        (if (str/starts-with? s "[")
+          (let [v (guard Exception ::bad (json/read-str s))]
+            (if (and (sequential? v) (every? string? v))
+              (clean v)
+              (throw (ex-info (str "pane refs: not a JSON array of strings: " s)
+                              {:type :tmux/bad-pane-refs :value s}))))
+          (clean (tokens s ",")))))))
 
 (defn- bool [x default]
   (cond (nil? x) default
@@ -136,9 +156,9 @@
   (let [h (h-of params)
         opts (compact-opts params h)
         threshold (or (:threshold opts) (:threshold compact/defaults))
-        exclude (set (as-list (:exclude params)))
+        exclude (set (pane-refs (:exclude params)))
         rows (panes/panes h {:provider :all})
-        refs (as-list (:pane params))
+        refs (pane-refs (:pane params))
         me (caller-pid (:_caller_id params))
         matched (if refs
                   (keep (fn [ref] (some #(when (some #{ref} (refs-of %)) %) rows)) refs)
@@ -268,7 +288,7 @@
       (r/ok (watch/start! (cond-> {:parent parent :host (h-of params)}
                             (:threshold params) (assoc :threshold (int-param (:threshold params) nil))
                             (:interval_ms params) (assoc :interval-ms (int-param (:interval_ms params) nil))
-                            (:exclude params) (assoc :exclude (vec (as-list (:exclude params))))))))))
+                            (:exclude params) (assoc :exclude (or (pane-refs (:exclude params)) []))))))))
 
 (defn watch-stop-cmd [_] (r/ok (or (watch/stop!) {:running? false})))
 
@@ -346,7 +366,7 @@
    "reseed"       {:type "string" :description "[tmux compact] Prompt sent after /compact (default \"hive workflow catchup /caveman\"; empty string sends none)."}
    "restore_goal" {:type "boolean" :description "[tmux compact] Re-send the pane's /goal after the re-seed (default true)."}
    "instructions" {:type "string" :description "[tmux compact] Text after /compact, as Claude Code's compaction instructions."}
-   "exclude"      {:type "string" :description "[tmux compact] Pane refs a sweep skips, comma-separated (e.g. your own pane)."}
+   "exclude"      {:type "string" :description "[tmux compact|watch start] Pane refs to skip (e.g. your own pane): a JSON array, a comma-separated string or one ref."}
    "force"        {:type "boolean" :description "[tmux compact] Compact even under threshold."}
    "dry_run"      {:type "boolean" :description "[tmux compact] List what would be compacted; start nothing."}
    "input_timeout_ms" {:type "integer" :description "[tmux compact|goal] How long text someone left at the prompt is waited out before the job skips as pending-human-input (default 600000; 0 skips at once)."}
