@@ -135,12 +135,6 @@
                                    (when-let [joined (join-session sessions name (:cwd pane))]
                                      [name joined]))
                                  names)
-                           (some (fn [key]
-                                   (let [identity (str (key pane))]
-                                     (when-not (str/blank? identity)
-                                       (when-let [session (some #(when (= identity (str (key %))) %) sessions)]
-                                         [(or (:name session) (first names)) {:session session}]))))
-                                 [:tty :pid])
                            [(first names) nil])
         {:keys [session ambiguous?]} joined
         status (some-> (:status session) keyword)]

@@ -1,6 +1,6 @@
 (ns hive-tmux.claude.panes-test
   (:require [clojure.string :as str]
-            [clojure.test :refer [deftest is testing]]
+            [clojure.test :refer [deftest is]]
             [hive-tmux.claude.panes :as panes]))
 
 ;; Copyright (C) 2026 Pedro Gomes Branquinho (BuddhiLW) <pedrogbranquinho@gmail.com>
@@ -8,7 +8,7 @@
 ;; SPDX-License-Identifier: MIT
 
 (def ^:private session
-  {:pid "200" :sessionId "sid-1" :name "caveman workflow catchup"
+  {:pid 200 :sessionId "sid-1" :name "caveman workflow catchup"
    :cwd "/srv/peer" :status "idle" :updatedAt 1})
 
 (def ^:private title-fixtures
@@ -48,25 +48,13 @@
     (is (= "caveman workflow catchup" (:name row)))
     (is (= "sid-1" (:session-id row)))))
 
-(deftest exact-terminal-identity-is-the-last-resort
-  (testing "tty"
-    (let [row (panes/pane-row {:title "unrelated" :tty "/dev/pts/7"} {}
-                              [(assoc session :tty "/dev/pts/7")])]
-      (is (= "sid-1" (:session-id row)))))
-  (testing "a numeric session pid equals the tmux string pid"
-    (let [row (panes/pane-row {:title "unrelated" :pid "1234"} {}
-                              [(assoc session :pid 1234)])]
-      (is (= "sid-1" (:session-id row)))))
-  (testing "blank and missing identities never match absent session identities"
-    (doseq [pane [{:title "unrelated"}
-                  {:title "unrelated" :tty "" :pid ""}
-                  {:title "unrelated" :tty nil :pid nil}]]
-      (let [row (panes/pane-row pane {} [(assoc session :name "other" :pid nil)])]
-        (is (true? (:unjoined? row)) (pr-str pane)))))
-  (testing "a name match is authoritative"
-    (let [row (panes/pane-row {:title "✳ caveman workflow catchup" :cwd "/srv/peer"
-                               :pid "200"}
-                              {}
-                              [(assoc session :pid "other")
-                               (assoc session :name "other" :sessionId "other" :pid "200")])]
-      (is (= "sid-1" (:session-id row))))))
+(deftest a-coincidental-pid-never-joins-a-session
+  (let [row (panes/pane-row {:pane "%1" :pid "25078" :tty "/dev/pts/4"
+                             :title "◉ xhigh · /effort  gamma"}
+                            {}
+                            [{:pid 25078 :sessionId "sid-STALE" :name "beta"
+                              :status "busy" :pidDomain "linux:other"}])]
+    (is (true? (:unjoined? row)))
+    (is (nil? (:session-id row)))
+    (is (= "gamma" (:name row)))
+    (is (= "/dev/pts/4" (:tty row)))))
