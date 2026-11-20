@@ -18,7 +18,7 @@
             [hive-tmux.claude.watch :as watch]
             [hive-tmux.claude.screen :as screen]
             [hive-tmux.claude.sense :as sense]
-            [clojure.data.json :as json]))
+            [clojure.edn :as edn]))
 
 ;; Copyright (C) 2026 Pedro Gomes Branquinho (BuddhiLW) <pedrogbranquinho@gmail.com>
 ;;
@@ -31,28 +31,29 @@
   (enumeration-seq (java.util.StringTokenizer. (str s) delims)))
 
 (defn pane-refs
-  "The one normalizer for every pane-ref list parameter (pane, exclude): a
-   vector of trimmed, non-blank ref strings, or nil when there are none.
-   Accepted: a JSON array (as data, or as its text, which is how a host may
-   hand over exclude=[\"%9\"]), a comma-separated string, or one ref. A
-   bracketed text that is not a JSON array of strings is refused (thrown, so
-   the dispatcher reports it), never read as a ref: excluding nothing because
-   of a stray bracket is the bug this exists to stop."
+  "The one normalizer for every pane-ref list parameter (pane, exclude), as a
+   Result: (r/ok refs), REFS a vector of trimmed, non-blank ref strings or nil
+   when there are none. Accepted: an array (as data, or as its printed or JSON
+   text: `[\"%9\" \"%5\"]` and `[\"%9\", \"%5\"]` both read, commas being
+   whitespace to the EDN reader), a comma-separated string, or one ref. A
+   bracketed text that is not an array of strings is (r/err
+   :tmux/bad-pane-refs), never read as a ref: excluding nothing because of a
+   stray bracket is the bug this exists to stop."
   [x]
   (let [clean (fn [xs] (not-empty (into [] (comp (map #(str/trim (str %))) (remove str/blank?)) xs)))]
     (cond
-      (nil? x) nil
-      (sequential? x) (clean x)
-      (set? x) (clean (sort x))
+      (nil? x) (r/ok nil)
+      (sequential? x) (r/ok (clean x))
+      (set? x) (r/ok (clean (sort x)))
       :else
       (let [s (str/trim (str x))]
         (if (str/starts-with? s "[")
-          (let [v (guard Exception ::bad (json/read-str s))]
-            (if (and (sequential? v) (every? string? v))
-              (clean v)
-              (throw (ex-info (str "pane refs: not a JSON array of strings: " s)
-                              {:type :tmux/bad-pane-refs :value s}))))
-          (clean (tokens s ",")))))))
+          (let [v (guard Exception ::bad (edn/read-string s))]
+            (if (and (vector? v) (every? string? v))
+              (r/ok (clean v))
+              (r/err :tmux/bad-pane-refs
+                     {:value s :hint "a JSON array of ref strings, e.g. [\"%9\",\"%5\"], or comma-separated: %9,%5"})))
+          (r/ok (clean (tokens s ","))))))))
 
 (defn- bool [x default]
   (cond (nil? x) default
@@ -151,47 +152,61 @@
    the :compact capability (e.g. Codex) starts no job.
    The caller's own pane (`_caller_id`) is never compacted here: named, the
    call is refused at once; in a sweep it is left out and reported, both
-   pointing at `swarm steer self` (see `self-compact`)."
+   pointing at `swarm steer self` (see `self-compact`).
+   supersede needs an explicit pane: a sweep with it is refused, since it
+   would cancel queued jobs on every due pane."
   [params]
-  (let [h (h-of params)
-        opts (compact-opts params h)
-        threshold (or (:threshold opts) (:threshold compact/defaults))
-        exclude (set (pane-refs (:exclude params)))
-        rows (panes/panes h {:provider :all})
-        refs (pane-refs (:pane params))
-        me (caller-pid (:_caller_id params))
-        matched (if refs
-                  (keep (fn [ref] (some #(when (some #{ref} (refs-of %)) %) rows)) refs)
-                  (filter #(and (= :claude (:provider %))
-                                (not (some exclude (refs-of %)))
-                                (compact/due? % threshold)) rows))
-        own (into [] (comp (filter #(own-pane? % me)) (distinct)) matched)
-        own-view (when (seq own)
-                   (assoc self-compact :own-pane (mapv #(select-keys % [:pane :name :ctx-tokens :goal-active?]) own)))
-        targets (remove #(own-pane? % me) matched)
-        unsupported (filterv #(not (contains? (:capabilities %) :compact)) targets)
-        plan (mapv #(select-keys % [:pane :target :name :provider :ctx-tokens :busy? :goal-active?]) targets)]
+  (let [exclude-r (pane-refs (:exclude params))
+        refs-r (pane-refs (:pane params))]
     (cond
-      (and refs (empty? matched))
-      (r/err :tmux/no-such-pane {:pane refs :known (mapv #(or (:name %) (:pane %)) rows)})
+      (r/err? exclude-r) (assoc exclude-r :param :exclude)
+      (r/err? refs-r) (assoc refs-r :param :pane)
 
-      (and refs (seq own))
-      (r/err :tmux/own-pane own-view)
-
-      (seq unsupported)
-      (r/err :tmux/unsupported-provider {:panes (mapv #(select-keys % [:pane :provider :capabilities]) unsupported)
-                                        :command :compact})
-
-      (bool (:dry_run params) false)
-      (r/ok (cond-> {:dry-run true :threshold threshold :would-compact plan}
-              own-view (assoc :skipped-own-pane own-view)))
+      (and (bool (:supersede params) false) (nil? (:ok refs-r)))
+      (r/err :tmux/supersede-needs-pane
+             {:hint (str "supersede=true cancels the queued job of the pane it names; a sweep would cancel them on every due pane. "
+                         "Pass pane=<%id|1:2.1|name|session-id>.")})
 
       :else
-      (r/ok (cond-> {:threshold threshold
-                     :started (mapv #(start-job! (:pane %) :compact (cond-> opts refs (assoc :force? true)))
-                                    targets)
-                     :hint "Poll with `swarm tmux job job_id=<id>`; status goes queued -> running -> done | skipped | failed."}
-              own-view (assoc :skipped-own-pane own-view))))))
+      (let [h (h-of params)
+            opts (compact-opts params h)
+            threshold (or (:threshold opts) (:threshold compact/defaults))
+            exclude (set (:ok exclude-r))
+            rows (panes/panes h {:provider :all})
+            refs (:ok refs-r)
+            me (caller-pid (:_caller_id params))
+            matched (if refs
+                      (keep (fn [ref] (some #(when (some #{ref} (refs-of %)) %) rows)) refs)
+                      (filter #(and (= :claude (:provider %))
+                                    (not (some exclude (refs-of %)))
+                                    (compact/due? % threshold)) rows))
+            own (into [] (comp (filter #(own-pane? % me)) (distinct)) matched)
+            own-view (when (seq own)
+                       (assoc self-compact :own-pane (mapv #(select-keys % [:pane :name :ctx-tokens :goal-active?]) own)))
+            targets (remove #(own-pane? % me) matched)
+            unsupported (filterv #(not (contains? (:capabilities %) :compact)) targets)
+            plan (mapv #(select-keys % [:pane :target :name :provider :ctx-tokens :busy? :goal-active?]) targets)]
+        (cond
+          (and refs (empty? matched))
+          (r/err :tmux/no-such-pane {:pane refs :known (mapv #(or (:name %) (:pane %)) rows)})
+
+          (and refs (seq own))
+          (r/err :tmux/own-pane own-view)
+
+          (seq unsupported)
+          (r/err :tmux/unsupported-provider {:panes (mapv #(select-keys % [:pane :provider :capabilities]) unsupported)
+                                            :command :compact})
+
+          (bool (:dry_run params) false)
+          (r/ok (cond-> {:dry-run true :threshold threshold :would-compact plan}
+                  own-view (assoc :skipped-own-pane own-view)))
+
+          :else
+          (r/ok (cond-> {:threshold threshold
+                         :started (mapv #(start-job! (:pane %) :compact (cond-> opts refs (assoc :force? true)))
+                                        targets)
+                         :hint "Poll with `swarm tmux job job_id=<id>`; status goes queued -> running -> done | skipped | failed."}
+                  own-view (assoc :skipped-own-pane own-view))))))))
 
 (defn job-cmd [{:keys [job_id] :as params}]
   (cond
@@ -282,13 +297,19 @@
                 (assoc :last-assistant (panes/last-assistant-text transcript))))))))
 
 (defn watch-start-cmd [params]
-  (let [parent (some-> (or (:parent params) (:agent_id params)) str str/trim not-empty)]
-    (if-not parent
+  (let [parent (some-> (or (:parent params) (:agent_id params)) str str/trim not-empty)
+        exclude-r (pane-refs (:exclude params))]
+    (cond
+      (not parent)
       (r/err :tmux/no-parent {:hint "parent=<your agent id>: the shouts are addressed to it, and `ss wait` hears its own parent by default"})
+
+      (r/err? exclude-r) (assoc exclude-r :param :exclude)
+
+      :else
       (r/ok (watch/start! (cond-> {:parent parent :host (h-of params)}
                             (:threshold params) (assoc :threshold (int-param (:threshold params) nil))
                             (:interval_ms params) (assoc :interval-ms (int-param (:interval_ms params) nil))
-                            (:exclude params) (assoc :exclude (or (pane-refs (:exclude params)) []))))))))
+                            (:exclude params) (assoc :exclude (or (:ok exclude-r) []))))))))
 
 (defn watch-stop-cmd [_] (r/ok (or (watch/stop!) {:running? false})))
 
@@ -361,12 +382,12 @@
 
 (def schema-ext
   {"pane_provider" {:type "string" :enum ["all" "claude" "codex"] :description "[tmux panes] Provider inventory filter (default all); independent of the model provider parameter."}
-   "pane"         {:type "string" :description "[tmux compact] Pane ref(s), comma-separated: %3, 1:3.1, a session name or session id. Omit to sweep every pane over threshold."}
+   "pane"         {:anyOf [{:type "array" :items {:type "string"}} {:type "string"}] :description "[tmux compact] Pane ref(s), comma-separated: %3, 1:3.1, a session name or session id. Omit to sweep every pane over threshold."}
    "threshold"    {:type "integer" :description "[tmux compact] Context tokens at or above which a pane is compacted (default 400000)."}
    "reseed"       {:type "string" :description "[tmux compact] Prompt sent after /compact (default \"hive workflow catchup /caveman\"; empty string sends none)."}
    "restore_goal" {:type "boolean" :description "[tmux compact] Re-send the pane's /goal after the re-seed (default true)."}
    "instructions" {:type "string" :description "[tmux compact] Text after /compact, as Claude Code's compaction instructions."}
-   "exclude"      {:type "string" :description "[tmux compact|watch start] Pane refs to skip (e.g. your own pane): a JSON array, a comma-separated string or one ref."}
+   "exclude"      {:anyOf [{:type "array" :items {:type "string"}} {:type "string"}] :description "[tmux compact|watch start] Pane refs to skip (e.g. your own pane): a JSON array, a comma-separated string or one ref."}
    "force"        {:type "boolean" :description "[tmux compact] Compact even under threshold."}
    "dry_run"      {:type "boolean" :description "[tmux compact] List what would be compacted; start nothing."}
    "input_timeout_ms" {:type "integer" :description "[tmux compact|goal] How long text someone left at the prompt is waited out before the job skips as pending-human-input (default 600000; 0 skips at once)."}
