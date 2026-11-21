@@ -26,6 +26,7 @@
             [hive-dsl.result :refer [guard]]
             [hive-tmux.claude.composer :as composer]
             [hive-tmux.claude.host :as host]
+            [hive-tmux.claude.interrupt :as interrupt]
             [hive-tmux.claude.panes :as panes]
             [hive-tmux.claude.poll :as poll]
             [taoensso.timbre :as log]))
@@ -55,7 +56,19 @@
    :input-timeout-ms (* 10 60 1000)
    ;; /compact is proven when the context falls under this share of what it
    ;; was, or by a new compact_boundary line in the transcript.
-   :drop-ratio 0.8})
+   :drop-ratio 0.8
+   ;; Cutting into a working turn (`hive-tmux.claude.interrupt`): :auto cuts
+   ;; in only on a pane whose /goal was active when the job began, after
+   ;; :interrupt-after-ms without rest, while a read-only wait (ss wait,
+   ;; await, sleep) or no tool runs; true drops the goal and wait gates;
+   ;; false never cuts in. Never mid-write, never over a draft.
+   :interrupt :auto
+   :interrupt-after-ms (* 5 60 1000)
+   ;; :force-send queues /compact and sends it now with C-x C-s (the running
+   ;; tool is moved to the background, not killed); :escape sends Esc until
+   ;; the turn stops, then /compact.
+   :interrupt-via :force-send
+   :escape-wait-ms 3000})
 
 ;;; Promote
 
@@ -92,6 +105,83 @@
   (when (and (some? before-count) (> (count boundaries) before-count))
     {:by :compact-boundary :tokens (:post-tokens (peek boundaries))}))
 
+(defn cancelled?
+  "Has JOB been cancelled? Terminal: nothing the job's runner writes after
+   it may change its status (`job-consistent?`, the state atom's validator,
+   enforces it)."
+  [job]
+  (= :cancelled (:status job)))
+
+(defn cancel-verdict
+  "May JOB (a job value) be cancelled now? {:cancel? true}, or a refusal:
+   :already-typed with the :step that typed first (a keystroke reached the
+   pane, so cancelling would leave half a command there), :already-cancelled,
+   or :not-active with the job's :status (it ended on its own)."
+  [job]
+  (cond (cancelled? job) {:refuse :already-cancelled}
+        (:typed-step job) {:refuse :already-typed :step (:typed-step job)}
+        (not (#{:queued :running} (:status job))) {:refuse :not-active :status (:status job)}
+        :else {:cancel? true}))
+
+(defn cancel-job
+  "JOB cancelled at NOW-MS for REASON, when `cancel-verdict` allows it; JOB
+   unchanged otherwise."
+  [job reason now-ms]
+  (if (:cancel? (cancel-verdict job))
+    (assoc job :status :cancelled :reason reason :cancelled-at now-ms :ended-at now-ms)
+    job))
+
+(defn claim-typing
+  "JOB about to type its STEP-KEY step: records the first step that types
+   (:typed-step), after which `cancel-verdict` refuses. A cancelled JOB is
+   returned unchanged, and must not type."
+  [job step-key]
+  (cond (cancelled? job) job
+        (:typed-step job) job
+        :else (assoc job :typed-step step-key)))
+
+(defn job-consistent?
+  "The job invariant a job's state atom validates: once cancelled (it carries
+   :cancelled-at), a job stays :cancelled. A runner still waiting when its job
+   was cancelled therefore cannot write a later status over it: the write is
+   refused and the runner stops there."
+  [job]
+  (or (not (contains? job :cancelled-at)) (cancelled? job)))
+
+(defn job-text
+  "The text JOB would type, as a supervisor reads it: the prompt of a say,
+   the /goal of a goal, the /compact (with instructions) of a compaction."
+  [{:keys [kind opts]}]
+  (case kind
+    :say (str (:text opts))
+    :goal (str "/goal " (or (:goal opts) (:goal-append opts)))
+    (str "/compact" (some->> (:instructions opts) str/trim not-empty (str " ")))))
+
+(defn blocking-view
+  "What an :already-running refusal says of the BLOCKING job value: its id,
+   kind, status, the first 80 characters of its text, and the step that
+   typed, if one did."
+  [job]
+  (let [text (job-text job)]
+    (cond-> {:job-id (:job-id job) :kind (:kind job :compact) :status (:status job)
+             :text (subs text 0 (min 80 (count text)))}
+      (:typed-step job) (assoc :typed-step (:typed-step job)))))
+
+(defn start-refusal
+  "Why a KIND job with OPTS would stop at once on the pane whose row is ROW,
+   without typing: {:reason kw ...}, or nil when it would go on to work.
+   The same cheap checks the runners make first (`compact!`, `start-row`,
+   `say!`), so a supersede cancels the blocking job only for a job that will
+   actually run."
+  [kind opts row]
+  (let [opts (merge defaults {:wait-idle? true} opts)]
+    (cond
+      (nil? row) {:reason :no-such-pane}
+      (and (= :say kind) (nil? (some-> (:text opts) str str/trim not-empty))) {:reason :no-text}
+      (and (= :compact kind) (not (:force? opts)) (not (due? row (:threshold opts))))
+      {:reason :under-threshold :ctx-tokens (:ctx-tokens row) :threshold (:threshold opts)}
+      (and (#{:say :goal} kind) (false? (:wait-idle? opts)) (not (idle? row))) {:reason :busy})))
+
 ;;; Pipeline
 
 (defn- step! [state k data]
@@ -118,7 +208,9 @@
    Still there, the job stops :skipped :pending-human-input naming the pane
    and the text; a pane that stayed busy stops it :skipped :busy. A slash
    command the composer does not hold back stops it :failed
-   :composer-mismatch with Enter unpressed (`composer/send-text!`)."
+   :composer-mismatch with Enter unpressed (`composer/send-text!`).
+   The first keystroke is claimed on STATE (`claim-typing`) in the same swap
+   a cancel would make, so a job cancelled before it types never types."
   [h state ref pane-id text step-key opts]
   (let [row0 (poll/observe h ref)
         free? (and (poll/idle? row0) (nil? (:input row0)))
@@ -129,7 +221,10 @@
                                      (swap! state assoc :waiting-on (assoc on :during step-key))
                                      (try (poll/wait-input-clear h ref opts wait-ms)
                                           (finally (swap! state dissoc :waiting-on)))))]
-    (if-not row
+    (cond
+      (cancelled? @state) false
+
+      (not row)
       (let [end (or (poll/observe h ref) row0)
             input (or (:input end) (:input row0))]
         (swap! state assoc :status :skipped :reason (if input :pending-human-input :busy)
@@ -139,6 +234,10 @@
                                      :hint (str "Text stands at the prompt of " pane-id " and was not typed over. "
                                                 "Send or clear it, then start the job again."))))
         false)
+
+      (cancelled? (swap! state claim-typing step-key)) false
+
+      :else
       (let [{:keys [submitted? composer]} (composer/send-text! h pane-id text (:vim-mode row))]
         (if submitted?
           (do (step! state step-key {:sent text}) true)
@@ -185,26 +284,104 @@
    :step-timeout-ms is a :timeout naming the step and the last screen. Proof
    seen, wait for a settled idle so the re-seed does not land on a working
    pane. Returns {:compacted evidence :row idle-row-or-nil}, or nil when it
-   stopped (status is set)."
-  [h state ref pane-id text before opts]
-  (let [{:keys [now-ms sleep!]} h
-        n0 (some-> (boundaries-of h (poll/observe h ref)) count)]
-    (when (deliver! h state ref pane-id text :compact opts)
-      (let [deadline (+ (now-ms) (:step-timeout-ms opts))
-            evidence (loop []
-                       (let [row (poll/observe h ref)
-                             ev (or (ctx-drop before row (:drop-ratio opts))
-                                    (boundary-seen n0 (boundaries-of h row)))]
-                         (cond ev ev
-                               (>= (now-ms) deadline) nil
-                               :else (do (sleep! (:poll-ms opts)) (recur)))))]
-        (if-not evidence
-          (timeout! h state ref :compact {:waited-for :compaction :tokens-before before})
-          (do (step! state :compacted evidence)
-              (swap! state assoc :compacted? true :compacted-by (:by evidence)
-                     :tokens-after-compact (:tokens evidence))
-              {:compacted evidence
-               :row (poll/wait-rest h ref poll/idle? opts (:step-timeout-ms opts))}))))))
+   stopped (status is set).
+
+   SEND!, a thunk answering truthy once TEXT went out, replaces the normal
+   delivery (`deliver!`, which waits for a free prompt): the force-send
+   interrupt types into a working pane on purpose (`force-send!`)."
+  ([h state ref pane-id text before opts]
+   (send-and-compact! h state ref pane-id text before opts
+                      #(deliver! h state ref pane-id text :compact opts)))
+  ([h state ref pane-id text before opts send!]
+   (let [{:keys [now-ms sleep!]} h
+         n0 (some-> (boundaries-of h (poll/observe h ref)) count)]
+     (when (send!)
+       (let [deadline (+ (now-ms) (:step-timeout-ms opts))
+             evidence (loop []
+                        (let [row (poll/observe h ref)
+                              ev (or (ctx-drop before row (:drop-ratio opts))
+                                     (boundary-seen n0 (boundaries-of h row)))]
+                          (cond ev ev
+                                (>= (now-ms) deadline) nil
+                                :else (do (sleep! (:poll-ms opts)) (recur)))))]
+         (if-not evidence
+           (timeout! h state ref :compact {:waited-for :compaction :tokens-before before})
+           (do (step! state :compacted evidence)
+               (swap! state assoc :compacted? true :compacted-by (:by evidence)
+                      :tokens-after-compact (:tokens evidence))
+               {:compacted evidence
+                :row (poll/wait-rest h ref poll/idle? opts (:step-timeout-ms opts))})))))))
+
+(defn- interrupt-gate
+  "Wait for rest like `poll/wait-rest`, but read the pane every :poll-ms and
+   ask `interrupt/verdict` whether the job may cut in instead. {:ready row}
+   at rest, {:interrupt verdict :row row} once allowed, nil at
+   :idle-timeout-ms. A changed hold reason is recorded as an :interrupt-hold
+   step and shown under :interrupt-hold, so a supervisor sees why it waits."
+  [h state ref pane-id start opts]
+  (let [{:keys [now-ms]} h
+        t0 (now-ms)
+        deadline (+ t0 (:idle-timeout-ms opts))
+        goal? (boolean (:goal-active? start))]
+    (loop [last-hold nil]
+      (if-let [row (poll/wait-rest h ref poll/idle? opts
+                                   (min (:poll-ms opts) (max 0 (- deadline (now-ms)))))]
+        (do (swap! state dissoc :interrupt-hold) {:ready row})
+        (let [row (poll/observe h ref)
+              tool (some-> (when row (panes/capture h pane-id 40)) interrupt/running-tool)
+              v (interrupt/verdict opts {:row row :tool tool :waited-ms (- (now-ms) t0)
+                                         :goal-at-start? goal?})]
+          (cond
+            (:interrupt? v) (do (swap! state dissoc :interrupt-hold) {:interrupt v :row row})
+            (>= (now-ms) deadline) nil
+            :else (do (when (not= (:hold v) last-hold)
+                        (step! state :interrupt-hold (select-keys v [:hold :tool]))
+                        (swap! state assoc :interrupt-hold (select-keys v [:hold :tool])))
+                      (recur (:hold v)))))))))
+
+(defn- escape-stop!
+  "Stop the running turn of PANE-ID with Esc, at most three, :escape-wait-ms
+   apart (in vim INSERT mode the first Esc only leaves insert mode). The idle
+   row, or nil when the pane kept working (:failed :interrupt-failed) or the
+   job was cancelled. The Esc is the job's first keystroke (`claim-typing`)."
+  [{:keys [tmux! sleep!] :as h} state ref pane-id verdict opts]
+  (when-not (cancelled? (swap! state claim-typing :interrupt))
+    (loop [n 0]
+      (let [row (poll/observe h ref)]
+        (cond
+          (and row (not (:busy? row)))
+          (do (step! state :interrupt {:via :escape :escapes n :tool (get-in verdict [:tool :tool])})
+              (swap! state assoc :interrupted-via :escape)
+              row)
+
+          (>= n 3)
+          (fail! state :interrupt-failed {:via :escape :escapes n :last (screen-state row)})
+
+          :else
+          (do (tmux! ["send-keys" "-t" pane-id "Escape"])
+              (sleep! (:escape-wait-ms opts))
+              (recur (inc n))))))))
+
+(defn- force-send!
+  "Type the /compact TEXT into the WORKING PANE-ID, where Claude Code queues
+   it (`Queued · ctrl+x ctrl+s to send now`), then send it now with C-x C-s:
+   the running tool is moved to the background, not killed, and the
+   compaction starts. True once sent; false when the job was cancelled or
+   the composer did not hold TEXT (:failed :composer-mismatch, Enter unpressed)."
+  [{:keys [tmux! sleep!] :as h} state pane-id text row verdict]
+  (if (cancelled? (swap! state claim-typing :interrupt))
+    false
+    (do (tmux! ["send-keys" "-t" pane-id "C-End"])
+        (let [{:keys [submitted? composer]} (composer/send-text! h pane-id text (:vim-mode row))]
+          (if-not submitted?
+            (boolean (fail! state :composer-mismatch
+                            {:during :interrupt :pane pane-id :expected text :composer composer}))
+            (do (sleep! 500)
+                (tmux! ["send-keys" "-t" pane-id "C-x" "C-s"])
+                (step! state :interrupt {:via :force-send :tool (get-in verdict [:tool :tool])})
+                (step! state :compact {:sent text :queued-then-forced true})
+                (swap! state assoc :interrupted-via :force-send)
+                true))))))
 
 (defn goal-after
   "The goal to set after the re-seed. GOAL (an override) wins over CAPTURED;
@@ -229,7 +406,9 @@
 
    REST: see the namespace docstring. Nothing here lands on a running turn."
   [h state ref opts]
-  (let [opts (merge defaults opts)
+  (let [opts (-> (merge defaults opts)
+                 (update :interrupt interrupt/mode-param)
+                 (update :interrupt-via interrupt/via-param))
         start (poll/observe h ref)
         ;; Proving rest is decided ONCE, from the pane as the job found it: the
         ;; /goal that makes a Stop hook restart the next turn is what /compact
@@ -246,22 +425,41 @@
 
       :else
       (let [pane-id (:pane start)]
-        (when-let [ready (do (step! state :wait-idle {})
-                             (or (poll/wait-rest h ref poll/idle? opts (:idle-timeout-ms opts))
-                                 (timeout! h state ref :wait-idle {:waited-for (poll/waited-for opts)})))]
-          (let [captured (when (and (:restore-goal? opts) (:goal-active? ready) (:session-id ready))
+        (when-let [gate (do (step! state :wait-idle {:interrupt (:interrupt opts)})
+                            (or (if (false? (:interrupt opts))
+                                  (some->> (poll/wait-rest h ref poll/idle? opts (:idle-timeout-ms opts))
+                                           (hash-map :ready))
+                                  (interrupt-gate h state ref pane-id start opts))
+                                (timeout! h state ref :wait-idle (cond-> {:waited-for (poll/waited-for opts)}
+                                                                   (:interrupt-hold @state)
+                                                                   (assoc :interrupt-hold (:interrupt-hold @state))))))]
+          (let [ready (or (:ready gate) (:row gate))
+                verdict (:interrupt gate)
+                captured (when (and (:restore-goal? opts) (:goal-active? ready) (:session-id ready))
                            (panes/goal-text (or ((:transcript h) (:cwd ready) (:session-id ready)) [])))
                 goal (goal-after opts captured)
                 reseed (when-not (str/blank? (:reseed opts)) (:reseed opts))
-                sends (cond-> [] reseed (conj [reseed :reseed]) goal (conj [(str "/goal " goal) :goal-restored]))]
-            (step! state :goal-captured {:captured captured :goal goal
-                                         :goal-active? (:goal-active? ready)})
-            (swap! state assoc :goal goal)
-            (when (and (:goal-active? ready) (:restore-goal? opts) (nil? captured) (nil? (:goal opts)))
-              (step! state :goal-unreadable {:note "goal active but no /goal text in the transcript; it will not be restored"}))
-            (when-let [{:keys [row]} (send-and-compact! h state ref pane-id
-                                                        (str "/compact" (some->> (:instructions opts) str/trim not-empty (str " ")))
-                                                        (:ctx-tokens ready) opts)]
+                sends (cond-> [] reseed (conj [reseed :reseed]) goal (conj [(str "/goal " goal) :goal-restored]))
+                text (str "/compact" (some->> (:instructions opts) str/trim not-empty (str " ")))
+                ;; The goal is read while the turn still runs, before any key.
+                _ (do (step! state :goal-captured {:captured captured :goal goal
+                                                   :goal-active? (:goal-active? ready)})
+                      (swap! state assoc :goal goal)
+                      (when (and (:goal-active? ready) (:restore-goal? opts) (nil? captured) (nil? (:goal opts)))
+                        (step! state :goal-unreadable {:note "goal active but no /goal text in the transcript; it will not be restored"})))
+                escaped (when (and verdict (= :escape (:interrupt-via opts)))
+                          (escape-stop! h state ref pane-id verdict opts))]
+            (when-let [{:keys [row]} (cond
+                                       (nil? verdict)
+                                       (send-and-compact! h state ref pane-id text (:ctx-tokens ready) opts)
+
+                                       (= :escape (:interrupt-via opts))
+                                       (when escaped
+                                         (send-and-compact! h state ref pane-id text (:ctx-tokens ready) opts))
+
+                                       :else
+                                       (send-and-compact! h state ref pane-id text (:ctx-tokens ready) opts
+                                                          #(force-send! h state pane-id text ready verdict)))]
               (cond
                 (and (nil? row) (seq sends))
                 (swap! state assoc :status :done :reason :pane-busy-after-compact
@@ -349,10 +547,38 @@
                         v)))
         @registry))
 
+(defn cancel!
+  "Cancel JOB-ID for REASON (:cancelled by default) if it has not typed yet
+   (`cancel-verdict`, decided inside the swap, so it cannot race the job's
+   first keystroke). The job ends :cancelled, which frees its pane's slot,
+   and its :on-end runs once with the cancelled job (the tmux-job sense).
+   {:cancelled? true :job job}, or {:cancelled? false :refuse kw ...} naming
+   why, e.g. :already-typed with the :step; nil when there is no such job."
+  ([job-id] (cancel! job-id :cancelled))
+  ([job-id reason]
+   (when-let [state (get @registry job-id)]
+     (let [[before after] (swap-vals! state cancel-job reason (System/currentTimeMillis))]
+       (if (and (not (cancelled? before)) (cancelled? after))
+         (let [on-end (:on-end (meta state))]
+           (when on-end (guard Exception nil (on-end after)))
+           {:cancelled? true :job after})
+         (merge {:cancelled? false :job (dissoc before :steps)} (cancel-verdict before)))))))
+
 (def ^:private runners
   {:compact #'compact!
    :say #'say!
    :goal #'goal!})
+
+(defn- cancellable-host
+  "H whose :sleep! ends the runner of STATE once its job is cancelled, so a
+   cancelled job stops at its next wait instead of polling the pane for up to
+   :idle-timeout-ms. Every wait sleeps through the host port, so this is the
+   one seam a runner needs."
+  [{:keys [sleep!] :as h} state]
+  (assoc h :sleep! (fn [ms]
+                     (when (cancelled? @state)
+                       (throw (ex-info "job cancelled" {:type ::cancelled :job-id (:job-id @state)})))
+                     (sleep! ms))))
 
 (defn start!
   "Start a background job on the pane REF names. OPTS :kind is :compact
@@ -361,27 +587,63 @@
    id, which /compact does not change. OPTS :on-end, a fn of the final job
    map, runs once when the job ends (how the watcher turns it into a sense).
    Pass :host in OPTS to use another port (tests); :sync? true runs in the
-   caller."
-  [ref {:keys [sync? on-end] :as opts}]
+   caller.
+
+   A job cancelled (`cancel!`) before its first keystroke ends :cancelled:
+   its state refuses any later status (`job-consistent?`), its runner stops at
+   its next wait (`cancellable-host`), and :on-end runs once, from `cancel!`.
+
+   :already-running names the blocking job (`blocking-view`) and hints
+   supersede. OPTS :supersede? true cancels that job (reason :superseded) when
+   it has not typed, and takes the slot; one that typed refuses :already-typed
+   naming the step, and nothing is started."
+  [ref {:keys [sync? on-end supersede?] :as opts}]
   (let [h (or (:host opts) (host/host))
         kind (or (:kind opts) :compact)
         runner (get runners kind)
-        row (poll/observe h ref)]
+        row (poll/observe h ref)
+        blocking (when (and runner row) (active-for (:pane row)))
+        ;; Cheap pre-checks first: a supersede cancels only for a job that will run.
+        doomed (when (and blocking supersede?) (start-refusal kind (dissoc opts :host) row))
+        superseded (when (and blocking supersede? (not doomed)) (cancel! (:job-id blocking) :superseded))]
     (cond
       (nil? runner) {:error :unknown-kind :kind kind}
-      (and row (active-for (:pane row))) {:error :already-running :job (active-for (:pane row))}
+
+      doomed
+      {:error :would-not-start :refusal doomed :blocking (blocking-view blocking)
+       :hint (str "The new " (name kind) " job would stop at once (" (name (:reason doomed)) "), so job "
+                  (:job-id blocking) " was not superseded.")}
+
+      (and blocking (not supersede?))
+      {:error :already-running :job blocking :blocking (blocking-view blocking)
+       :hint (str "Pane " (:pane row) " holds " (name (:kind blocking :compact)) " job " (:job-id blocking)
+                  ". supersede=true cancels it, if it has not typed yet, and takes the slot; or `swarm tmux job job_id="
+                  (:job-id blocking) " cancel=true`.")}
+
+      (= :already-typed (:refuse superseded))
+      {:error :already-typed :step (:step superseded) :blocking (blocking-view (:job superseded))
+       :hint (str "Job " (:job-id blocking) " already typed its " (name (:step superseded))
+                  " step into pane " (:pane row) "; it is not superseded. Wait for it to end.")}
+
       :else
-      (let [job (assoc (new-job ref (dissoc opts :on-end)) :kind kind)
-            state (atom (assoc job :pane (:pane row)))
-            follow (or (:pane row) ref)]
+      (let [job (cond-> (assoc (new-job ref (dissoc opts :on-end :supersede?)) :kind kind)
+                  (:cancelled? superseded) (assoc :superseded (:job-id blocking)))
+            state (atom (assoc job :pane (:pane row))
+                        :meta {:on-end on-end}
+                        :validator job-consistent?)
+            follow (or (:pane row) ref)
+            h (cancellable-host h state)]
         (swap! registry assoc (:job-id job) state)
-        (let [work #(try (runner h state follow (dissoc opts :host :sync? :kind :on-end))
+        (let [work #(try (runner h state follow (dissoc opts :host :sync? :kind :on-end :supersede?))
                          (catch Throwable t
-                           (fail! state :threw {:message (.getMessage t)})
+                           (when-not (cancelled? @state)
+                             (fail! state :threw {:message (.getMessage t)}))
                            @state)
                          (finally
-                           (swap! state assoc :ended-at (System/currentTimeMillis))
-                           (when on-end (guard Exception nil (on-end @state)))))]
+                           ;; A cancelled job was ended, and announced, by `cancel!`.
+                           (when-not (cancelled? @state)
+                             (swap! state assoc :ended-at (System/currentTimeMillis))
+                             (when on-end (guard Exception nil (on-end @state))))))]
           (if sync?
             (work)
             (do (future (work)) @state)))))))
