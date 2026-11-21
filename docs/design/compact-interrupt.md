@@ -1,5 +1,14 @@
 # Design note: `tmux compact interrupt=true`
 
+> **Status, 2026-11-21: implemented** as `interrupt=auto|true|false` on
+> `fix/compact-interrupt` (`hive-tmux.claude.interrupt`). The consent gate
+> below was replaced by a screen gate: auto cuts in only on a /goal pane after
+> `interrupt_after_ms` while a read-only wait or no tool runs, never mid-write
+> or over a draft. The default `interrupt_via=force-send` (queued /compact +
+> C-x C-s) backgrounds the running tool instead of killing it. Measured:
+> docs/assay/compact-interrupt-2026-11-21.md. The text below is the original
+> note, kept for its reasoning.
+
 Card 20261120021807-1a6075cf, follow-up of 2026-11-20 02:35. Not implemented
 in feat/tmux-job-cancel.
 
