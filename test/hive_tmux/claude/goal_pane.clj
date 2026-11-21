@@ -32,6 +32,14 @@
                                            "<command-message>goal</command-message>\n"
                                            "<command-args>" args "</command-args>")}}))
 
+(defn goal-status-line
+  "The `goal_status` attachment Claude Code 2.1.330 writes when it checks a
+   goal (copied from session 15c7760e, whose goal left no /goal entry)."
+  ([condition] (goal-status-line condition false))
+  ([condition met?]
+   (json/write-str {:type "attachment"
+                    :attachment {:type "goal_status" :met met? :sentinel true :condition condition}})))
+
 (def tools
   {:ss-wait ["● hive - swarm (MCP)(command: \"ss wait\", parent: \"coordinator:ce1435b2\", timeout_ms: 100000)"
              "  ⎿  Running…"]
@@ -43,18 +51,25 @@
 
 (defn- write? [tool] (= :ship-land tool))
 
-(defn screen [{:keys [tokens busy? goal? tool queued compacting typed vim human]}]
+(defn screen [{:keys [tokens busy? goal? tool queued compacting typed vim human] :as s}]
   (vec (concat
         ["● Support loop: still waiting on the lanes."]
         (when (and busy? tool) (get tools tool))
-        (when queued [(str "❯ " queued) "  ⎿  Queued · ctrl+x ctrl+s to send now"])
+        (when (seq queued) (conj (mapv #(str "\u001b[38;5;246m\u001b[48;5;237m❯ " % "\u001b[39m") queued)
+                                 "\u001b[49m  ⎿  Queued · ctrl+x ctrl+s to send now"))
         [(cond (pos? (or compacting 0)) "✢ Compacting conversation… (3s · ↓ 211 tokens)"
                busy? "✻ Calculating… (1h 49m 53s · ↓ 118.9k tokens)"
                :else "✻ Worked for 2s")
          "  ⎿  Tip: Use /btw to ask a side question without interrupting Claude"
          (str "   " tokens " tokens" (when goal? " · ◎ /goal active (2h)"))
          "──────────── peer one ─"
-         (str "❯\u00a0" (or human typed (when queued "Press up to edit queued messages")))
+         (str "❯\u00a0" (or human
+                            ;; Pane %8 (job cc-a49d0119): with a human message
+                            ;; queued, the composer read back that message,
+                            ;; not the /compact just typed.
+                            (when (and typed (seq queued) (:recall-queued? s)) (first queued))
+                            typed
+                            (when (seq queued) "\u001b[2mPress up to edit queued messages\u001b[0m")))
          "────────────"
          (str "  " (if (= :normal vim) "-- NORMAL --" "-- INSERT --") " ⏵⏵ auto mode on")])))
 
@@ -81,7 +96,7 @@
         s (assoc s :typed nil)]
     (cond
       (str/blank? line) s
-      (or (:busy? s) (pos? (or (:compacting s) 0))) (assoc s :queued line)
+      (or (:busy? s) (pos? (or (:compacting s) 0))) (update s :queued (fnil conj []) line)
       (str/starts-with? line "/compact") (compact-now (assoc s :typed nil))
       :else (-> s (update :sent conj line)
                 (assoc :busy? true :tool nil :busy-reads 2)
@@ -100,16 +115,26 @@
     s))
 
 (defn- chord! [s ks]
-  (if (and (= ["C-x" "C-s"] ks) (:queued s))
-    (let [line (:queued s)
-          s (-> s (assoc :queued nil :backgrounded (:tool s)))]
-      (if (str/starts-with? line "/compact") (compact-now s) (update s :sent conj line)))
+  (if (and (= ["C-x" "C-s"] ks) (seq (:queued s)))
+    ;; Every queued line goes out now, in order; the human's land in :sent
+    ;; and in :human-delivered, and the turn goes on with them.
+    (let [lines (:queued s)
+          s (-> s (assoc :queued nil :backgrounded (:tool s)))
+          compact? (some #(str/starts-with? % "/compact") lines)
+          s (reduce (fn [s l] (if (str/starts-with? l "/compact")
+                                s
+                                (-> s (update :sent conj l) (update :human-delivered (fnil conj []) l))))
+                    s lines)]
+      (if compact? (compact-now s) s))
     (reduce key! s ks)))
 
 (defn goal-pane
   "{:state atom :host port}. OPTS: :tokens (default 540000), :tool (the
    running call, default :ss-wait), :vim (:insert), :busy? (true), :goal?
-   (true), :compact-reads (3), :human (a draft at the prompt), :tick (a fn
+   (true), :compact-reads (3), :human (a draft at the prompt), :queued (a
+   vector of messages someone SUBMITTED while the turn ran, waiting in the
+   queue), :recall-queued? (the composer reads back the first queued
+   message while one waits, as pane %8 did), :transcript, :tick (a fn
    of the pane state run before every screen read: a scripted timeline that
    changes the running tool or ends the turn, keyed on :clock)."
   ([] (goal-pane {}))
