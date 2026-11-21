@@ -109,7 +109,9 @@
 (defn goal-pane
   "{:state atom :host port}. OPTS: :tokens (default 540000), :tool (the
    running call, default :ss-wait), :vim (:insert), :busy? (true), :goal?
-   (true), :compact-reads (3), :human (a draft at the prompt)."
+   (true), :compact-reads (3), :human (a draft at the prompt), :tick (a fn
+   of the pane state run before every screen read: a scripted timeline that
+   changes the running tool or ends the turn, keyed on :clock)."
   ([] (goal-pane {}))
   ([opts]
    (let [st (atom (merge {:tokens 540000 :tool :ss-wait :vim :insert :busy? true :goal? true
@@ -123,7 +125,7 @@
                 ([argv _stdin]
                  (case (first argv)
                    "list-panes" {:exit 0 :out "%9\t1\t3\t1\t100\tclaude\t/srv/peer\t✳ peer one\t/dev/pts/9\n" :err ""}
-                   "capture-pane" (let [s (swap! st on-read)] {:exit 0 :out (str/join "\n" (screen s)) :err ""})
+                   "capture-pane" (let [s (swap! st (comp on-read (:tick opts identity)))] {:exit 0 :out (str/join "\n" (screen s)) :err ""})
                    "send-keys" (let [[_ _ _ & ks] argv]
                                  (swap! st update :keys conj (vec ks))
                                  (if (= "-l" (first ks))
