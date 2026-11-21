@@ -167,7 +167,7 @@
     (let [opts (:opts @w)]
       (shout! opts :tmux-job
               (into {} (remove (comp nil? val))
-                    {:message (str (name (:kind job :compact)) " " (:job-id job) " on " (:name job) ": "
+                    {:message (str (name (:kind job :compact)) " " (:job-id job) " on " (or (:name job) (:pane job) (:ref job)) ": "
                                    (name (:status job)) (some->> (:reason job) name (str " ")))
                      :tmux-pane (:pane job) :tmux-name (:name job)
                      :tmux-job-id (:job-id job) :tmux-job-kind (some-> (:kind job) name)
