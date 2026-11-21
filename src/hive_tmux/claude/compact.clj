@@ -26,6 +26,7 @@
             [hive-dsl.result :refer [guard]]
             [hive-tmux.claude.composer :as composer]
             [hive-tmux.claude.host :as host]
+            [hive-tmux.claude.interrupt :as interrupt]
             [hive-tmux.claude.panes :as panes]
             [hive-tmux.claude.poll :as poll]
             [taoensso.timbre :as log]))
@@ -55,7 +56,19 @@
    :input-timeout-ms (* 10 60 1000)
    ;; /compact is proven when the context falls under this share of what it
    ;; was, or by a new compact_boundary line in the transcript.
-   :drop-ratio 0.8})
+   :drop-ratio 0.8
+   ;; Cutting into a working turn (`hive-tmux.claude.interrupt`): :auto cuts
+   ;; in only on a pane whose /goal was active when the job began, after
+   ;; :interrupt-after-ms without rest, while a read-only wait (ss wait,
+   ;; await, sleep) or no tool runs; true drops the goal and wait gates;
+   ;; false never cuts in. Never mid-write, never over a draft.
+   :interrupt :auto
+   :interrupt-after-ms (* 5 60 1000)
+   ;; :force-send queues /compact and sends it now with C-x C-s (the running
+   ;; tool is moved to the background, not killed); :escape sends Esc until
+   ;; the turn stops, then /compact.
+   :interrupt-via :force-send
+   :escape-wait-ms 3000})
 
 ;;; Promote
 
@@ -271,26 +284,104 @@
    :step-timeout-ms is a :timeout naming the step and the last screen. Proof
    seen, wait for a settled idle so the re-seed does not land on a working
    pane. Returns {:compacted evidence :row idle-row-or-nil}, or nil when it
-   stopped (status is set)."
-  [h state ref pane-id text before opts]
-  (let [{:keys [now-ms sleep!]} h
-        n0 (some-> (boundaries-of h (poll/observe h ref)) count)]
-    (when (deliver! h state ref pane-id text :compact opts)
-      (let [deadline (+ (now-ms) (:step-timeout-ms opts))
-            evidence (loop []
-                       (let [row (poll/observe h ref)
-                             ev (or (ctx-drop before row (:drop-ratio opts))
-                                    (boundary-seen n0 (boundaries-of h row)))]
-                         (cond ev ev
-                               (>= (now-ms) deadline) nil
-                               :else (do (sleep! (:poll-ms opts)) (recur)))))]
-        (if-not evidence
-          (timeout! h state ref :compact {:waited-for :compaction :tokens-before before})
-          (do (step! state :compacted evidence)
-              (swap! state assoc :compacted? true :compacted-by (:by evidence)
-                     :tokens-after-compact (:tokens evidence))
-              {:compacted evidence
-               :row (poll/wait-rest h ref poll/idle? opts (:step-timeout-ms opts))}))))))
+   stopped (status is set).
+
+   SEND!, a thunk answering truthy once TEXT went out, replaces the normal
+   delivery (`deliver!`, which waits for a free prompt): the force-send
+   interrupt types into a working pane on purpose (`force-send!`)."
+  ([h state ref pane-id text before opts]
+   (send-and-compact! h state ref pane-id text before opts
+                      #(deliver! h state ref pane-id text :compact opts)))
+  ([h state ref pane-id text before opts send!]
+   (let [{:keys [now-ms sleep!]} h
+         n0 (some-> (boundaries-of h (poll/observe h ref)) count)]
+     (when (send!)
+       (let [deadline (+ (now-ms) (:step-timeout-ms opts))
+             evidence (loop []
+                        (let [row (poll/observe h ref)
+                              ev (or (ctx-drop before row (:drop-ratio opts))
+                                     (boundary-seen n0 (boundaries-of h row)))]
+                          (cond ev ev
+                                (>= (now-ms) deadline) nil
+                                :else (do (sleep! (:poll-ms opts)) (recur)))))]
+         (if-not evidence
+           (timeout! h state ref :compact {:waited-for :compaction :tokens-before before})
+           (do (step! state :compacted evidence)
+               (swap! state assoc :compacted? true :compacted-by (:by evidence)
+                      :tokens-after-compact (:tokens evidence))
+               {:compacted evidence
+                :row (poll/wait-rest h ref poll/idle? opts (:step-timeout-ms opts))})))))))
+
+(defn- interrupt-gate
+  "Wait for rest like `poll/wait-rest`, but read the pane every :poll-ms and
+   ask `interrupt/verdict` whether the job may cut in instead. {:ready row}
+   at rest, {:interrupt verdict :row row} once allowed, nil at
+   :idle-timeout-ms. A changed hold reason is recorded as an :interrupt-hold
+   step and shown under :interrupt-hold, so a supervisor sees why it waits."
+  [h state ref pane-id start opts]
+  (let [{:keys [now-ms]} h
+        t0 (now-ms)
+        deadline (+ t0 (:idle-timeout-ms opts))
+        goal? (boolean (:goal-active? start))]
+    (loop [last-hold nil]
+      (if-let [row (poll/wait-rest h ref poll/idle? opts
+                                   (min (:poll-ms opts) (max 0 (- deadline (now-ms)))))]
+        (do (swap! state dissoc :interrupt-hold) {:ready row})
+        (let [row (poll/observe h ref)
+              tool (some-> (when row (panes/capture h pane-id 40)) interrupt/running-tool)
+              v (interrupt/verdict opts {:row row :tool tool :waited-ms (- (now-ms) t0)
+                                         :goal-at-start? goal?})]
+          (cond
+            (:interrupt? v) (do (swap! state dissoc :interrupt-hold) {:interrupt v :row row})
+            (>= (now-ms) deadline) nil
+            :else (do (when (not= (:hold v) last-hold)
+                        (step! state :interrupt-hold (select-keys v [:hold :tool]))
+                        (swap! state assoc :interrupt-hold (select-keys v [:hold :tool])))
+                      (recur (:hold v)))))))))
+
+(defn- escape-stop!
+  "Stop the running turn of PANE-ID with Esc, at most three, :escape-wait-ms
+   apart (in vim INSERT mode the first Esc only leaves insert mode). The idle
+   row, or nil when the pane kept working (:failed :interrupt-failed) or the
+   job was cancelled. The Esc is the job's first keystroke (`claim-typing`)."
+  [{:keys [tmux! sleep!] :as h} state ref pane-id verdict opts]
+  (when-not (cancelled? (swap! state claim-typing :interrupt))
+    (loop [n 0]
+      (let [row (poll/observe h ref)]
+        (cond
+          (and row (not (:busy? row)))
+          (do (step! state :interrupt {:via :escape :escapes n :tool (get-in verdict [:tool :tool])})
+              (swap! state assoc :interrupted-via :escape)
+              row)
+
+          (>= n 3)
+          (fail! state :interrupt-failed {:via :escape :escapes n :last (screen-state row)})
+
+          :else
+          (do (tmux! ["send-keys" "-t" pane-id "Escape"])
+              (sleep! (:escape-wait-ms opts))
+              (recur (inc n))))))))
+
+(defn- force-send!
+  "Type the /compact TEXT into the WORKING PANE-ID, where Claude Code queues
+   it (`Queued · ctrl+x ctrl+s to send now`), then send it now with C-x C-s:
+   the running tool is moved to the background, not killed, and the
+   compaction starts. True once sent; false when the job was cancelled or
+   the composer did not hold TEXT (:failed :composer-mismatch, Enter unpressed)."
+  [{:keys [tmux! sleep!] :as h} state pane-id text row verdict]
+  (if (cancelled? (swap! state claim-typing :interrupt))
+    false
+    (do (tmux! ["send-keys" "-t" pane-id "C-End"])
+        (let [{:keys [submitted? composer]} (composer/send-text! h pane-id text (:vim-mode row))]
+          (if-not submitted?
+            (boolean (fail! state :composer-mismatch
+                            {:during :interrupt :pane pane-id :expected text :composer composer}))
+            (do (sleep! 500)
+                (tmux! ["send-keys" "-t" pane-id "C-x" "C-s"])
+                (step! state :interrupt {:via :force-send :tool (get-in verdict [:tool :tool])})
+                (step! state :compact {:sent text :queued-then-forced true})
+                (swap! state assoc :interrupted-via :force-send)
+                true))))))
 
 (defn goal-after
   "The goal to set after the re-seed. GOAL (an override) wins over CAPTURED;
@@ -315,7 +406,9 @@
 
    REST: see the namespace docstring. Nothing here lands on a running turn."
   [h state ref opts]
-  (let [opts (merge defaults opts)
+  (let [opts (-> (merge defaults opts)
+                 (update :interrupt interrupt/mode-param)
+                 (update :interrupt-via interrupt/via-param))
         start (poll/observe h ref)
         ;; Proving rest is decided ONCE, from the pane as the job found it: the
         ;; /goal that makes a Stop hook restart the next turn is what /compact
@@ -332,22 +425,41 @@
 
       :else
       (let [pane-id (:pane start)]
-        (when-let [ready (do (step! state :wait-idle {})
-                             (or (poll/wait-rest h ref poll/idle? opts (:idle-timeout-ms opts))
-                                 (timeout! h state ref :wait-idle {:waited-for (poll/waited-for opts)})))]
-          (let [captured (when (and (:restore-goal? opts) (:goal-active? ready) (:session-id ready))
+        (when-let [gate (do (step! state :wait-idle {:interrupt (:interrupt opts)})
+                            (or (if (false? (:interrupt opts))
+                                  (some->> (poll/wait-rest h ref poll/idle? opts (:idle-timeout-ms opts))
+                                           (hash-map :ready))
+                                  (interrupt-gate h state ref pane-id start opts))
+                                (timeout! h state ref :wait-idle (cond-> {:waited-for (poll/waited-for opts)}
+                                                                   (:interrupt-hold @state)
+                                                                   (assoc :interrupt-hold (:interrupt-hold @state))))))]
+          (let [ready (or (:ready gate) (:row gate))
+                verdict (:interrupt gate)
+                captured (when (and (:restore-goal? opts) (:goal-active? ready) (:session-id ready))
                            (panes/goal-text (or ((:transcript h) (:cwd ready) (:session-id ready)) [])))
                 goal (goal-after opts captured)
                 reseed (when-not (str/blank? (:reseed opts)) (:reseed opts))
-                sends (cond-> [] reseed (conj [reseed :reseed]) goal (conj [(str "/goal " goal) :goal-restored]))]
-            (step! state :goal-captured {:captured captured :goal goal
-                                         :goal-active? (:goal-active? ready)})
-            (swap! state assoc :goal goal)
-            (when (and (:goal-active? ready) (:restore-goal? opts) (nil? captured) (nil? (:goal opts)))
-              (step! state :goal-unreadable {:note "goal active but no /goal text in the transcript; it will not be restored"}))
-            (when-let [{:keys [row]} (send-and-compact! h state ref pane-id
-                                                        (str "/compact" (some->> (:instructions opts) str/trim not-empty (str " ")))
-                                                        (:ctx-tokens ready) opts)]
+                sends (cond-> [] reseed (conj [reseed :reseed]) goal (conj [(str "/goal " goal) :goal-restored]))
+                text (str "/compact" (some->> (:instructions opts) str/trim not-empty (str " ")))
+                ;; The goal is read while the turn still runs, before any key.
+                _ (do (step! state :goal-captured {:captured captured :goal goal
+                                                   :goal-active? (:goal-active? ready)})
+                      (swap! state assoc :goal goal)
+                      (when (and (:goal-active? ready) (:restore-goal? opts) (nil? captured) (nil? (:goal opts)))
+                        (step! state :goal-unreadable {:note "goal active but no /goal text in the transcript; it will not be restored"})))
+                escaped (when (and verdict (= :escape (:interrupt-via opts)))
+                          (escape-stop! h state ref pane-id verdict opts))]
+            (when-let [{:keys [row]} (cond
+                                       (nil? verdict)
+                                       (send-and-compact! h state ref pane-id text (:ctx-tokens ready) opts)
+
+                                       (= :escape (:interrupt-via opts))
+                                       (when escaped
+                                         (send-and-compact! h state ref pane-id text (:ctx-tokens ready) opts))
+
+                                       :else
+                                       (send-and-compact! h state ref pane-id text (:ctx-tokens ready) opts
+                                                          #(force-send! h state pane-id text ready verdict)))]
               (cond
                 (and (nil? row) (seq sends))
                 (swap! state assoc :status :done :reason :pane-busy-after-compact

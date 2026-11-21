@@ -18,6 +18,7 @@
             [hive-tmux.claude.watch :as watch]
             [hive-tmux.claude.screen :as screen]
             [hive-tmux.claude.sense :as sense]
+            [hive-tmux.claude.interrupt :as interrupt]
             [clojure.edn :as edn]))
 
 ;; Copyright (C) 2026 Pedro Gomes Branquinho (BuddhiLW) <pedrogbranquinho@gmail.com>
@@ -109,7 +110,10 @@
     (some? (:input_timeout_ms params)) (assoc :input-timeout-ms (int-param (:input_timeout_ms params) nil))
     (some? (:between_turns params)) (assoc :between-turns? (between-turns-param (:between_turns params)))
     (bool (:force params) false) (assoc :force? true)
-    (bool (:supersede params) false) (assoc :supersede? true)))
+    (bool (:supersede params) false) (assoc :supersede? true)
+    (some? (:interrupt params)) (assoc :interrupt (interrupt/mode-param (:interrupt params)))
+    (some? (:interrupt_after_ms params)) (assoc :interrupt-after-ms (int-param (:interrupt_after_ms params) nil))
+    (some? (:interrupt_via params)) (assoc :interrupt-via (interrupt/via-param (:interrupt_via params)))))
 
 (defn- start-job!
   "Every job this subdomain starts reports its end to the pane watcher, which
@@ -207,6 +211,14 @@
                                         targets)
                          :hint "Poll with `swarm tmux job job_id=<id>`; status goes queued -> running -> done | skipped | failed."}
                   own-view (assoc :skipped-own-pane own-view))))))))
+
+(declare job-cmd)
+
+(defn cancel-cmd
+  "`tmux cancel job_id=<id>`: cancel a job that has not typed yet. The same
+   as `tmux job job_id=<id> cancel=true`."
+  [params]
+  (job-cmd (assoc params :cancel true)))
 
 (defn job-cmd [{:keys [job_id] :as params}]
   (cond
@@ -321,7 +333,10 @@
               :params [:pane_provider :include_goal :socket_name]}
    "compact" {:fn compact-cmd
               :doc "Wait for rest, capture the /goal, send /compact, re-seed (default \"hive workflow catchup /caveman\"), restore the goal. pane=<ref,...> compacts those panes whatever their size; no pane = every pane over threshold (default 400000) minus exclude. Rest is a settled idle, except on a pane whose /goal is active: a /goal Stop hook restarts the next turn within a poll, so there the job reads the single turn boundary between turns (between_turns=auto, the default; true forces it, false forces the settled idle). Text someone left at a prompt is waited out up to input_timeout_ms (default 600000), never typed over; the job shows it under :waiting-on. Your OWN pane is refused (a sweep leaves it out): compact yourself with `swarm steer self input=/compact then=<reseed> dry_run=false`. Background job; returns job ids."
-              :params [:pane :threshold :reseed :restore_goal :goal :goal_append :instructions :exclude :force :dry_run :input_timeout_ms :between_turns :supersede :socket_name]}
+              :params [:pane :threshold :reseed :restore_goal :goal :goal_append :instructions :exclude :force :dry_run :input_timeout_ms :between_turns :supersede :interrupt :interrupt_after_ms :interrupt_via :socket_name]}
+   "cancel"  {:fn cancel-cmd
+              :doc "Cancel a queued or waiting compact|say|goal job (job_id=<id>) that has not typed into its pane yet: it ends :cancelled and frees the pane's slot, so a new job can start there. A job that typed refuses :already-typed, naming the step."
+              :params [:job_id]}
    "goal"    {:fn goal-cmd
               :doc "Arm or replace a pane's /goal WITHOUT compacting: goal=<text> replaces, goal_append=<text> extends the active one. Waits for a settled idle (wait_idle=false: skip a busy pane); text at the prompt is waited out up to input_timeout_ms (not with wait_idle=false), then stops it. Background job; job ends with goal-active-after?."
               :params [:pane :goal :goal_append :wait_idle :input_timeout_ms :supersede :socket_name]}
@@ -404,6 +419,9 @@
    "interval_ms"  {:type "integer" :description "[tmux watch start] Tick interval (default 5000)."}
    "job_id"       {:type "string" :description "[tmux job] Compaction job id from tmux compact."}
    "cancel"       {:type "boolean" :description "[tmux job] With job_id: cancel that job if it has not typed into the pane yet."}
+   "interrupt"    {:type "string" :enum ["auto" "true" "false"] :description "[tmux compact] Cut into a working turn that never reaches rest (a /goal pane looping on ss wait). auto (default): only on a pane whose /goal was active when the job began, after interrupt_after_ms without rest, while a read-only wait (ss wait, await, sleep) or no tool runs. true: also without a goal or wait, and for an unclassified tool. false: never. Never while a write runs (git, ship land, kubectl apply ...) or text stands at the prompt."}
+   "interrupt_after_ms" {:type "integer" :description "[tmux compact] How long interrupt=auto waits for rest before it may cut in (default 300000)."}
+   "interrupt_via" {:type "string" :enum ["force-send" "escape"] :description "[tmux compact] force-send (default): type /compact, which Claude Code queues, then C-x C-s to send it now; the running tool moves to the background, not killed. escape: Esc until the turn stops (kills the tool call), then /compact."}
    "supersede"    {:type "boolean" :description "[tmux compact|say|goal] Cancel the pane's queued job if it has not typed yet and take its slot (default false: refuse :already-running naming it)."}})
 
 
