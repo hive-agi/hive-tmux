@@ -43,7 +43,20 @@
    [:vim-mode [:maybe [:enum :insert :normal]]]
    [:activity [:maybe :string]]
    [:input [:maybe :string]]
-   [:suggestion [:maybe :string]]])
+   [:suggestion [:maybe :string]]
+   [:queued {:optional true} [:maybe [:vector :string]]]])
+
+(def queued-marker
+  "What Claude Code 2.1.330 draws under the last message submitted while a
+   turn runs (`⎿  Queued · ctrl+x ctrl+s to send now`): the `❯ text` lines
+   above it were SUBMITTED, they wait in Claude Code's queue, and C-x C-s
+   sends them now. Measured on a live pane, 2026-11-21."
+  "Queued · ctrl+x ctrl+s")
+
+(def queue-hint
+  "The text Claude Code draws in an EMPTY composer while messages are queued.
+   No one typed it, so it is never :input."
+  "Press up to edit queued messages")
 
 (def ^:private segment-sep " · ")
 (def ^:private goal-mark "◎ /goal active")
@@ -107,12 +120,33 @@
 (defn- prompt? [line]
   (str/starts-with? (str/triml (str line)) "❯"))
 
+(defn- queued-line?
+  "Is the `❯` line at I of LINES a QUEUED message (Claude Code draws a
+   submitted-while-busy message as `❯ text` over `⎿  Queued · ctrl+x ...`),
+   not the composer? The marker shows under it before any rule or prompt."
+  [lines i]
+  (boolean
+   (some (fn [l] (str/includes? l "Queued · ctrl+x ctrl+s"))
+         (take-while (fn [l] (let [t (str/trim l)]
+                               (not (or (str/starts-with? t "❯")
+                                        (and (seq t) (every? #(= \─ %) t))))))
+                     (subvec (vec lines) (min (count lines) (inc i)))))))
+
 (defn- prompt-index
   "Index of the last prompt line, or nil. Facts are read only above it, so a
-   prompt the user is typing cannot fake them."
+   prompt the user is typing cannot fake them. A queued message's `❯` line is
+   not the prompt: read as one, its text would pass for a draft."
   [lines]
-  (some (fn [i] (when (prompt? (nth lines i)) i))
-        (range (dec (count lines)) -1 -1)))
+  (let [cands (filter #(and (prompt? (nth lines %)) (not (queued-line? lines %)))
+                      (range (dec (count lines)) -1 -1))
+        ;; The composer opens its box: the line over it is a rule. A `❯ text`
+        ;; line with no rule over it is a message already SENT, echoed in the
+        ;; conversation (job cc-a49d0119 read the sent `ct` back as the
+        ;; composer). It is the prompt only when no boxed one is on screen.
+        boxed? (fn [i] (let [prev (some #(let [t (str/trim (nth lines %))] (when (seq t) t))
+                                        (range (dec i) -1 -1))]
+                         (boolean (some-> prev (str/starts-with? "─")))))]
+    (or (some #(when (boxed? %) %) cands) (first cands))))
 
 (defn- last-some [f lines]
   (some f (rseq (vec lines))))
@@ -272,6 +306,35 @@
       {:input nil :suggestion visible}
       {:input text :suggestion nil})))
 
+(defn- queued-lines
+  "The messages waiting in Claude Code's queue, read from LINES (stripped)
+   above the prompt at P: the `❯ text` lines directly over the last
+   `queued-marker` line, oldest first, a wrapped message joined back by a
+   space. Nil when nothing is queued. These were SUBMITTED by someone; they
+   are not text at the prompt."
+  [lines p]
+  (let [above (subvec lines (max 0 (- p 30)) p)
+        m (some #(when (str/includes? (nth above %) queued-marker) %)
+                (range (dec (count above)) -1 -1))]
+    (when m
+      (let [block (loop [i (dec m) acc ()]
+                    (if (neg? i)
+                      acc
+                      (let [l (nth above i) t (utrim l)]
+                        (if (or (str/starts-with? t "❯")
+                                (and (seq t) (>= (count (take-while #{\space \u00a0} l)) 2)
+                                     (not (str/starts-with? t "⎿")) (not (str/starts-with? t "●"))))
+                          (recur (dec i) (cons l acc))
+                          acc))))
+            block (drop-while #(not (str/starts-with? (utrim %) "❯")) block)
+            msgs (reduce (fn [acc l]
+                           (let [t (utrim l)]
+                             (if (str/starts-with? t "❯")
+                               (conj acc (utrim (subs t 1)))
+                               (if (seq acc) (conj (pop acc) (str (peek acc) " " t)) acc))))
+                         [] block)]
+        (not-empty (filterv seq msgs))))))
+
 (defn read-screen
   "The facts of LINES, a pane capture top to bottom, escapes kept (`tmux
    capture-pane -e`) or not. A screen with no prompt is `:claude? false` with
@@ -296,7 +359,11 @@
       (let [above (subvec lines (max 0 (- p 12)) p)
             goal (last-some goal-of above)
             activity (last-some activity-of above)
-            {:keys [input suggestion]} (prompt-split raw lines p)]
+            {:keys [input suggestion]} (prompt-split raw lines p)
+            ;; The queue hint is Claude Code's, drawn into an empty composer;
+            ;; a capture without escapes cannot prove it dim, so name it here.
+            [input suggestion] (if (= queue-hint input) [nil queue-hint] [input suggestion])
+            queued (queued-lines lines p)]
         {:claude? true
          :ctx-tokens (last-some ctx-tokens-of above)
          :busy? (boolean activity)
@@ -307,7 +374,8 @@
          :vim-mode (vim-mode (subvec lines p))
          :activity activity
          :input input
-         :suggestion suggestion})
+         :suggestion suggestion
+         :queued queued})
       unread)))
 
 (m/=> read-screen [:=> [:cat [:sequential :string]] Screen])

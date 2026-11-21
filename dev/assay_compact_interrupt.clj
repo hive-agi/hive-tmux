@@ -19,9 +19,14 @@
    :outcome/latency-ms is the FAKE-clock time from job start to /compact sent
    (time to compact), or the job's end when it never compacted.
 
+   Scenario :queued-human (`*scenario*`, pane %8, job cc-a49d0119): the
+   operator queued 1-3 messages into the turn and the goal has only a
+   goal_status line. Pass also needs every queued message delivered.
+
    Run (warm REPL with hive-assay on the classpath):
      (load-file \"dev/assay_compact_interrupt.clj\")
-     (assay-compact-interrupt/run! {:replicates 20})"
+     (assay-compact-interrupt/run! {:replicates 20})
+     (assay-compact-interrupt/run! {:replicates 20 :scenario :queued-human})"
   (:refer-clojure :exclude [run!])
   (:require [hive-assay.adapters.mock-transport :as mt]
             [hive-assay.domain :as d]
@@ -66,7 +71,8 @@
     (cond
       (some #(= "/compact" %) (:sent s)) (cond-> s (nil? (:compact-at s)) (assoc :compact-at (:clock s)))
       ;; An interrupted turn stays stopped (measured: recycle-goal-pane.sh).
-      (or (:escaped s) (:queued s) (pos? (or (:compacting s) 0))) s
+      ;; A human message queued before the job does not stop the timeline.
+      (or (:escaped s) (some #{"/compact"} (:queued s)) (pos? (or (:compacting s) 0))) s
       :else (let [[tool] (or (at tl (:clock s)) [:ss-wait])]
               (if (= :boundary tool)
                 (assoc s :busy? false :tool nil)
@@ -77,11 +83,29 @@
    :interrupt-force-send {:interrupt :auto :interrupt-via :force-send}
    :interrupt-escape {:interrupt :auto :interrupt-via :escape}})
 
+(def ^:dynamic *scenario*
+  ":plain (the pane as above) or :queued-human: before the job starts, the
+   operator SUBMITTED 1-3 short messages into the working turn (pane %8,
+   job cc-a49d0119), so they wait in Claude Code's queue and the composer
+   reads back the first one; and the /goal was set without a /goal entry,
+   so only a goal_status line names it. Pass then also needs every queued
+   message delivered (:human-delivered), in order."
+  :plain)
+
+(defn- queued-for [seed]
+  (let [rnd (java.util.Random. (+ 7919 (long seed)))]
+    (vec (for [i (range (inc (.nextInt rnd 3)))] (str "ct " seed "-" i)))))
+
 (defn trial
   "Run one compact job of ARM on the fake pane of SEED. A plain map of facts."
   [arm seed]
   (let [tl (timeline seed)
-        {:keys [state host]} (gp/goal-pane {:tick (tick-fn tl)})
+        queued? (= :queued-human *scenario*)
+        queued (when queued? (queued-for seed))
+        {:keys [state host]} (gp/goal-pane (cond-> {:tick (tick-fn tl)}
+                                             queued? (assoc :queued queued :recall-queued? true
+                                                            :transcript ["{\"type\":\"x\"}"
+                                                                         (gp/goal-status-line gp/goal-text)])))
         job (compact/start! "%9" (merge {:host host :sync? true :poll-ms poll-ms}
                                         (get arm-opts arm)))
         s @state]
@@ -89,17 +113,19 @@
      :compacted? (boolean (:compacted? job))
      :goal-restored? (boolean (and (:goal-active-after? job)
                                    (some #(= (str "/goal " gp/goal-text) %) (:sent s))))
+     :human-delivered? (or (not queued?) (= queued (:human-delivered s)))
      :write-cut (or (:write-cut s) 0)
      :interrupted-via (:interrupted-via job)
      :time-to-compact-ms (or (:compact-at s) (:clock s))
      :boundary? (boolean (some #(= :boundary (nth % 2)) tl))}))
 
-(defn outcome [{:keys [compacted? goal-restored? write-cut time-to-compact-ms]}]
+(defn outcome [{:keys [compacted? goal-restored? human-delivered? write-cut time-to-compact-ms]}]
   (d/run-outcome {:outcome/status :completed
                   :outcome/turns 1
                   :outcome/events (cond-> #{}
                                     compacted? (conj :compacted)
                                     goal-restored? (conj :goal-restored)
+                                    human-delivered? (conj :human-delivered)
                                     (zero? write-cut) (conj :no-write-cut))
                   :outcome/cost-usd 0.0
                   :outcome/latency-ms time-to-compact-ms}))
@@ -110,7 +136,7 @@
                :specimen/tools #{}
                :specimen/params {:arm :old-job}
                :specimen/oracle (d/oracle {:oracle/kind :signal-coverage
-                                           :expected #{:compacted :goal-restored :no-write-cut}})}))
+                                           :expected #{:compacted :goal-restored :human-delivered :no-write-cut}})}))
 
 (defn experiment [replicates]
   (d/experiment {:experiment/id "tmux-compact-interrupt"
@@ -124,12 +150,12 @@
 
 (defn run!
   "Run the experiment; answer {:experiment Result :table per-arm summary}."
-  [{:keys [replicates] :or {replicates 20}}]
+  [{:keys [replicates scenario] :or {replicates 20 scenario :plain}}]
   (let [facts (atom [])
         transport (mt/mock-transport
                    (fn [sp {:keys [seed]}]
                      (let [arm (get-in sp [:specimen/params :arm])
-                           f (trial arm seed)]
+                           f (binding [*scenario* scenario] (trial arm seed))]
                        (swap! facts conj (assoc f :arm arm :seed seed))
                        (outcome f))))
         res (run/run-experiment! transport (experiment replicates) {:concurrency 1})

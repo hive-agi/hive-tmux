@@ -74,23 +74,46 @@
     content
     (str/join "\n" (keep :text content))))
 
-(defn goal-text
-  "The text of the latest /goal LINES (a transcript, oldest first) set, or nil
-   when the latest /goal cleared it or none was ever set. A raw line is only a
-   candidate; the marker is checked again on the decoded content, because a
-   JSON writer may spell `/` as `\\/`."
-  [lines]
+(defn- goal-entry
+  "What one transcript LINE says of the goal: {:args text} for a `/goal`
+   command entry, {:condition text :met? bool} for Claude Code's own
+   `goal_status` attachment, nil otherwise. A raw line is only a candidate;
+   the marker is checked again on the decoded entry, because a JSON writer
+   may spell `/` as `\\/`."
+  [line]
   (let [mark "<command-name>/goal</command-name>"
-        candidate? #(or (str/includes? % mark)
-                        (str/includes? % "<command-name>\\/goal<\\/command-name>"))
-        decoded (fn [line]
-                  (let [text (some-> (guard Exception nil (json/read-str line :key-fn keyword))
-                                     :message :content content-text)]
-                    (when (and text (str/includes? text mark)) text)))
-        text (some decoded (filter candidate? (rseq (vec lines))))
-        args (some-> text command-args str/trim)]
-    (when-not (or (str/blank? args) (#{"clear" "off" "stop"} (str/lower-case args)))
-      args)))
+        line (str line)]
+    (when (or (str/includes? line mark)
+              (str/includes? line "<command-name>\\/goal<\\/command-name>")
+              (str/includes? line "goal_status"))
+      (when-let [e (guard Exception nil (json/read-str line :key-fn keyword))]
+        (let [att (:attachment e)
+              text (some-> e :message :content content-text)]
+          (cond
+            (and (= "goal_status" (:type att)) (string? (:condition att)))
+            {:condition (:condition att) :met? (true? (:met att))}
+
+            (and text (str/includes? text mark))
+            {:args (or (some-> text command-args str/trim) "")}))))))
+
+(defn goal-text
+  "The goal the latest goal entry of LINES (a transcript, oldest first) set,
+   or nil when that entry cleared or met it, or there is none.
+
+   Two entries say it. A `/goal <text>` command typed at the prompt, and the
+   `goal_status` attachment Claude Code writes each time it checks the goal
+   (`{\"type\":\"goal_status\",\"met\":false,\"condition\":<text>}`). A goal
+   set some other way (pane %8, 2026-11-21: a /goal in a queued message, or
+   one restored on resume) leaves no command entry, only the attachment, so
+   the newest of either kind wins."
+  [lines]
+  (let [entry (some goal-entry (rseq (vec lines)))]
+    (cond
+      (nil? entry) nil
+      (:condition entry) (when-not (:met? entry) (not-empty (str/trim (:condition entry))))
+      :else (let [args (:args entry)]
+              (when-not (or (str/blank? args) (#{"clear" "off" "stop"} (str/lower-case args)))
+                args)))))
 
 (defn last-assistant-text
   "The text of the newest assistant message in LINES (a transcript, oldest
