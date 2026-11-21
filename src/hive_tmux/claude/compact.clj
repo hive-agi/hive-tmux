@@ -505,6 +505,13 @@
                                         "The pane is compacted anyway; set it again with `tmux goal pane=" pane-id " goal=...`.")]
                           (step! state :goal-unreadable {:note note})
                           (swap! state assoc :goal-unreadable note))))
+                ;; Esc would cut the turn that takes a queued human message in,
+                ;; so with one waiting the interrupt is a force-send instead.
+                opts (if (and verdict (= :escape (:interrupt-via opts))
+                              (seq (:queued (queue-now h pane-id))))
+                       (do (step! state :interrupt-via {:via :force-send :why :human-message-queued})
+                           (assoc opts :interrupt-via :force-send))
+                       opts)
                 escaped (when (and verdict (= :escape (:interrupt-via opts)))
                           (escape-stop! h state ref pane-id verdict opts))]
             (when-let [{:keys [row]} (cond
