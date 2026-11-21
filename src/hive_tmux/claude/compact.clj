@@ -29,6 +29,7 @@
             [hive-tmux.claude.interrupt :as interrupt]
             [hive-tmux.claude.panes :as panes]
             [hive-tmux.claude.poll :as poll]
+            [hive-tmux.claude.screen :as screen]
             [taoensso.timbre :as log]))
 
 ;; Copyright (C) 2026 Pedro Gomes Branquinho (BuddhiLW) <pedrogbranquinho@gmail.com>
@@ -362,26 +363,79 @@
               (sleep! (:escape-wait-ms opts))
               (recur (inc n))))))))
 
+(defn- queue-now
+  "What waits in the queue of PANE-ID now: {:queued [text ...] :hint? bool},
+   :hint? when the composer shows `screen/queue-hint`."
+  [h pane-id]
+  (let [s (screen/read-screen (or (panes/capture h pane-id 40) []))]
+    {:queued (or (:queued s) []) :hint? (= screen/queue-hint (:suggestion s))}))
+
+(def ^:private flush-reads
+  "Reads, 300 ms apart, a flush waits for the queue to empty. Claude Code
+   takes a queued message in at the turn's next model call, which can come
+   later; the job goes on anyway, since /compact queues behind it."
+  10)
+
+(defn- flush-queued!
+  "Send now, with C-x C-s, the messages someone SUBMITTED to the working
+   PANE-ID that wait in Claude Code's queue (`screen/queued-marker`): they are
+   that person's intent, delivered before /compact and never dropped. Each is
+   recorded under :human-sent and as a :human-sent step. The texts sent;
+   nil when nothing was queued."
+  [{:keys [tmux! sleep!] :as h} state pane-id]
+  (let [{:keys [queued hint?]} (queue-now h pane-id)]
+    (when (or (seq queued) hint?)
+      (tmux! ["send-keys" "-t" pane-id "C-x" "C-s"])
+      (step! state :human-sent {:texts queued :via :force-send})
+      (swap! state update :human-sent (fnil into []) queued)
+      (loop [n flush-reads]
+        (sleep! 300)
+        (let [q (queue-now h pane-id)]
+          (when (and (pos? n) (or (seq (:queued q)) (:hint? q)))
+            (recur (dec n)))))
+      queued)))
+
 (defn- force-send!
   "Type the /compact TEXT into the WORKING PANE-ID, where Claude Code queues
    it (`Queued · ctrl+x ctrl+s to send now`), then send it now with C-x C-s:
    the running tool is moved to the background, not killed, and the
    compaction starts. True once sent; false when the job was cancelled or
-   the composer did not hold TEXT (:failed :composer-mismatch, Enter unpressed)."
+   the composer did not hold TEXT (:failed :composer-mismatch, Enter unpressed).
+
+   A message someone already SUBMITTED that waits in the queue is not a
+   draft: it is sent first (`flush-queued!`), then /compact is typed. An
+   unsent draft never gets here: `interrupt/verdict` holds on it."
   [{:keys [tmux! sleep!] :as h} state pane-id text row verdict]
   (if (cancelled? (swap! state claim-typing :interrupt))
     false
-    (do (tmux! ["send-keys" "-t" pane-id "C-End"])
-        (let [{:keys [submitted? composer]} (composer/send-text! h pane-id text (:vim-mode row))]
-          (if-not submitted?
-            (boolean (fail! state :composer-mismatch
-                            {:during :interrupt :pane pane-id :expected text :composer composer}))
-            (do (sleep! 500)
-                (tmux! ["send-keys" "-t" pane-id "C-x" "C-s"])
-                (step! state :interrupt {:via :force-send :tool (get-in verdict [:tool :tool])})
-                (step! state :compact {:sent text :queued-then-forced true})
-                (swap! state assoc :interrupted-via :force-send)
-                true))))))
+    (let [flushed (flush-queued! h state pane-id)
+          ;; A /compact already in the queue (an earlier attempt) went out
+          ;; with the flush: typing a second one would compact twice.
+          already (some #(when (composer/holds? text %) %) flushed)
+          {:keys [submitted? composer]}
+          (if already
+            {:submitted? true}
+            (do (tmux! ["send-keys" "-t" pane-id "C-End"])
+                (composer/send-text! h pane-id text (:vim-mode row))))]
+      (cond
+        already
+        (do (step! state :interrupt {:via :force-send :tool (get-in verdict [:tool :tool])})
+            (step! state :compact {:sent already :was-queued true})
+            (swap! state assoc :interrupted-via :force-send)
+            true)
+
+        (not submitted?)
+        (boolean (fail! state :composer-mismatch
+                        (cond-> {:during :interrupt :pane pane-id :expected text :composer composer}
+                          (seq (:human-sent @state)) (assoc :human-sent (:human-sent @state)))))
+
+        :else
+        (do (sleep! 500)
+            (tmux! ["send-keys" "-t" pane-id "C-x" "C-s"])
+            (step! state :interrupt {:via :force-send :tool (get-in verdict [:tool :tool])})
+            (step! state :compact {:sent text :queued-then-forced true})
+            (swap! state assoc :interrupted-via :force-send)
+            true)))))
 
 (defn goal-after
   "The goal to set after the re-seed. GOAL (an override) wins over CAPTURED;
@@ -446,7 +500,11 @@
                                                    :goal-active? (:goal-active? ready)})
                       (swap! state assoc :goal goal)
                       (when (and (:goal-active? ready) (:restore-goal? opts) (nil? captured) (nil? (:goal opts)))
-                        (step! state :goal-unreadable {:note "goal active but no /goal text in the transcript; it will not be restored"})))
+                        (let [note (str "The /goal is active but its text is in neither a /goal entry nor a goal_status "
+                                        "entry of the session transcript, so it will NOT be restored after /compact. "
+                                        "The pane is compacted anyway; set it again with `tmux goal pane=" pane-id " goal=...`.")]
+                          (step! state :goal-unreadable {:note note})
+                          (swap! state assoc :goal-unreadable note))))
                 escaped (when (and verdict (= :escape (:interrupt-via opts)))
                           (escape-stop! h state ref pane-id verdict opts))]
             (when-let [{:keys [row]} (cond
