@@ -57,3 +57,31 @@ keystroke into a WORKING turn, which every job here is built never to do. It
 needs its own consent model, a live-pane verification plan and review, and it
 touches `poll` and the composer. That is not small, so it belongs on its own
 card.
+
+## Queued human messages (2026-11-21, job cc-a49d0119)
+
+Measured on Claude Code 2.1.330: a message submitted while a turn runs is
+drawn above the spinner as `❯ text` (background 237) over
+`⎿  Queued · ctrl+x ctrl+s to send now`, and the empty composer shows
+`Press up to edit queued messages`. The message was SUBMITTED: it is not a
+draft. `screen/read-screen` reports it under `:queued`, never `:input`.
+
+The force-send interrupt sends the queue first with C-x C-s (step
+`:human-sent`, job key `:human-sent`), so the human's intent is delivered,
+never dropped, and then types `/compact`. A `/compact` already in the queue
+goes out with that flush and is not typed twice. With a message queued, an
+`interrupt_via=escape` job force-sends instead: Esc would cut the turn that
+takes the message in. An unsent draft at the prompt still holds the job
+(`:prompt-holds-text`).
+
+## The goal without a /goal entry
+
+A goal can be set without a `<command-name>/goal` transcript entry (session
+15c7760e). Claude Code still writes `{"type":"goal_status","condition":...}`
+each time it checks the goal, so `panes/goal-text` reads the newest entry of
+either kind (a met goal is none). With neither, the job records
+`:goal-unreadable` (step and job key): the goal will not be restored, and the
+pane is compacted anyway.
+
+Assay, queued-human scenario, n=20 per arm: force-send 20/20, escape 20/20,
+old job 0/20, 0 writes cut.
