@@ -126,7 +126,7 @@
   (testing "a recorded AskUserQuestion menu"
     (let [{:keys [state host]} (host-from-fixture (fixture "recorded-ask-user-question-2.1.329"))
           job (compact/start! "%7" (assoc fast :host host :kind :goal :goal "take card 2"))]
-      (is (= [:skipped :dialog] [(:status job) (:reason job)]))
+      (is (= [:skipped :open-dialog] [(:status job) (:reason job)]))
       (is (= "" (:typed @state))))))
 
 ;;; say: a dialog is reported, reply text is not a dialog
@@ -138,7 +138,7 @@
           {:keys [state host]} (host-from-fixture lines)
           job (compact/start! "%7" (assoc fast :host host :kind :say :text "use staging"))]
       (is (some? (:dialog (screen/read-screen lines))) name)
-      (is (= [:skipped :dialog] [(:status job) (:reason job)]) name)
+      (is (= [:skipped :open-dialog] [(:status job) (:reason job)]) name)
       (is (= "esc to cancel" (get-in job [:error :dialog :evidence])) name)
       (is (< (:clock @state) 1000) (str name ": reported at once"))
       (is (empty? (:sent @state)) name))))

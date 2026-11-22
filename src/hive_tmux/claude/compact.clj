@@ -82,6 +82,30 @@
   [row threshold]
   (boolean (some-> (:ctx-tokens row) (>= threshold))))
 
+(defn open-dialog?
+  "Is a dialog open on the pane of ROW? Its screen shows a menu or permission
+   dialog (:dialog), or Claude Code's own session status is :waiting: the
+   session waits on a human's answer. A :waiting pane shows no spinner, so it
+   reads idle, and a job that trusted idle alone would type into the dialog."
+  [row]
+  (boolean (and row (or (:dialog row) (= :waiting (:status row))))))
+
+(defn human-guard
+  "Why nothing may be typed into the pane of ROW now, for a human's sake, or
+   nil when nothing stops it (the human-draft guard, card
+   20261122160537-60f33c7a):
+     {:reason :open-dialog ...}            a dialog is open (`open-dialog?`)
+     {:reason :human-typing :input text}   someone's text stands at the prompt
+   Nothing lifts it: :force? skips a compaction's threshold, never a person,
+   and an interrupt holds on a draft too (`interrupt/verdict`). A job either
+   keeps waiting (queued, :waiting-on) or ends :skipped with this :reason."
+  [row]
+  (cond
+    (open-dialog? row) (cond-> {:reason :open-dialog}
+                         (:dialog row) (assoc :dialog (:dialog row))
+                         (= :waiting (:status row)) (assoc :status :waiting))
+    (:input row) {:reason :human-typing :input (:input row)}))
+
 (defn screen-state
   "What a timeout reports of the pane's last ROW: enough for a supervisor to
    tell a slow pane from a stuck one without reading the screen itself."
@@ -181,7 +205,9 @@
       (and (= :say kind) (nil? (some-> (:text opts) str str/trim not-empty))) {:reason :no-text}
       (and (= :compact kind) (not (:force? opts)) (not (due? row (:threshold opts))))
       {:reason :under-threshold :ctx-tokens (:ctx-tokens row) :threshold (:threshold opts)}
-      (:dialog row) {:reason :dialog :dialog (:dialog row)}
+      (open-dialog? row) (human-guard row)
+      ;; A say is never queued behind a draft (`say!`); compact and goal wait it out.
+      (and (= :say kind) (:input row)) (human-guard row)
       ;; A /goal needs no rest (`goal!`), so only a say is refused as busy.
       (and (= :say kind) (false? (:wait-idle? opts)) (not (idle? row))) {:reason :busy})))
 
@@ -265,17 +291,20 @@
    no dialog on screen. A working turn does not matter: /goal is accepted
    while busy (the pane's footer shows `/goal active (3s)` at once)."
   [row]
-  (boolean (and row (some? (:ctx-tokens row)) (nil? (:input row)) (nil? (:dialog row)))))
+  (boolean (and row (some? (:ctx-tokens row)) (nil? (:input row)) (not (open-dialog? row)))))
 
 (defn- dialog-stop!
-  "Stop the job :skipped :dialog: a menu or permission dialog is on the pane,
-   so nothing is typed, and the dialog is reported instead of waited on
-   (`tmux answer` picks an option). After the compaction it is advisory."
+  "Stop the job :skipped :open-dialog: a menu or permission dialog is on the
+   pane, or its session is :waiting on a human (`open-dialog?`), so nothing is
+   typed, and the dialog is reported instead of waited on (`tmux answer` picks
+   an option). After the compaction it is advisory."
   [state pane-id row step-key]
-  (stop! state :skipped :dialog
-         {:during step-key :pane pane-id :dialog (:dialog row) :last (screen-state row)
-          :hint (str "A Claude Code menu or permission dialog is open on " pane-id
-                     "; nothing was typed. Answer it (`tmux answer`), then start the job again.")}))
+  (stop! state :skipped :open-dialog
+         (cond-> {:during step-key :pane pane-id :last (screen-state row)
+                  :hint (str "A Claude Code menu or permission dialog is open on " pane-id
+                             "; nothing was typed. Answer it (`tmux answer`), then start the job again.")}
+           (:dialog row) (assoc :dialog (:dialog row))
+           (= :waiting (:status row)) (assoc :status :waiting))))
 
 (defn- deliver!
   "Type TEXT once the prompt is free (no one's text there, pane idle); true
@@ -283,38 +312,42 @@
    it is waited out (`poll/wait-input-clear`, which also outlasts the turn it
    starts once sent) for at most :input-timeout-ms, while the job shows it
    under :waiting-on, and not at all when that is 0 or :wait-idle? is false.
-   Still there, the job stops :skipped :pending-human-input naming the pane
-   and the text; a pane that stayed busy stops it :skipped :busy. A slash
-   command the composer does not hold back stops it :failed
+   Still there, the job stops :skipped :human-typing naming the pane and the
+   text; a pane that stayed busy stops it :skipped :busy; an open dialog
+   (`open-dialog?`: on screen, or the session :waiting) stops it :skipped
+   :open-dialog, never waited out and never typed into. Nothing in OPTS lifts
+   this guard (`human-guard`): :force? is a compaction's threshold only.
+   A slash command the composer does not hold back stops it :failed
    :composer-mismatch with Enter unpressed (`composer/send-text!`).
    The first keystroke is claimed on STATE (`claim-typing`) in the same swap
    a cancel would make, so a job cancelled before it types never types."
   [h state ref pane-id text step-key opts]
   (let [row0 (poll/observe h ref)
         goal-cmd? (goal-command? text)
-        free? (if goal-cmd? (goal-free? row0) (and (poll/idle? row0) (nil? (:input row0))))
+        free? (if goal-cmd? (goal-free? row0) (and (poll/idle? row0) (nil? (human-guard row0))))
         wait-ms (if (false? (:wait-idle? opts)) 0 (or (:input-timeout-ms opts) 0))
-        on (if (:input row0) {:pending-human-input (:input row0)} {:pane-busy true})
-        row (cond (:dialog row0) nil
+        on (if (:input row0) {:human-typing (:input row0)} {:pane-busy true})
+        row (cond (open-dialog? row0) nil
                   free? row0
                   (pos? wait-ms) (do (step! state :wait-input (assoc on :during step-key :timeout-ms wait-ms))
                                      (swap! state assoc :waiting-on (assoc on :during step-key))
                                      (try (if goal-cmd?
-                                            (poll/wait-until h ref #(or (goal-free? %) (:dialog %)) opts wait-ms)
+                                            (poll/wait-until h ref #(or (goal-free? %) (open-dialog? %)) opts wait-ms)
                                             (poll/wait-input-clear h ref opts wait-ms))
                                           (finally (swap! state dissoc :waiting-on)))))
-        row (when-not (:dialog row) row)]
+        ;; The guard is read again on the row the job would type into.
+        row (when-not (human-guard row) row)]
     (cond
       (cancelled? @state) false
 
-      (and (not row) (:dialog (or (poll/observe h ref) row0)))
+      (and (not row) (open-dialog? (or (poll/observe h ref) row0)))
       (do (dialog-stop! state pane-id (or (poll/observe h ref) row0) step-key) false)
 
       (not row)
       (let [end (or (poll/observe h ref) row0)
             input (or (:input end) (:input row0))]
         ;; After the compaction this is advisory: the job ends :done (`stop!`).
-        (stop! state :skipped (if input :pending-human-input :busy)
+        (stop! state :skipped (if input :human-typing :busy)
                (cond-> {:during step-key :pane pane-id :name (:name end)
                         :waited-ms wait-ms :last (screen-state end)}
                  input (assoc :input input
@@ -653,7 +686,8 @@
       (not (or (:force? opts) (due? start (:threshold opts))))
       (swap! state assoc :status :skipped :reason :under-threshold)
 
-      (:dialog start)
+      ;; :force? lifts the threshold above, never this guard.
+      (open-dialog? start)
       (dialog-stop! state (:pane start) start :start)
 
       :else
@@ -770,7 +804,14 @@
     (cond
       (nil? start) (fail! state :no-such-pane {:ref ref})
       ;; A dialog is reported at once, never waited out as if it were work.
-      (:dialog start) (dialog-stop! state (:pane start) start :start)
+      (open-dialog? start) (dialog-stop! state (:pane start) start :start)
+      ;; A say is not queued behind a draft: refused at once, no idle wait first.
+      (and (:refuse-input? opts) (:input start))
+      (stop! state :skipped :human-typing
+             {:during :start :pane (:pane start) :name (:name start) :input (:input start)
+              :last (screen-state start)
+              :hint (str "Text stands at the prompt of " (:pane start) " and was not typed over. "
+                         "Send or clear it, then start the job again.")})
       (nil? (:ctx-tokens start))
       (stop! state :skipped :unreadable-screen
              {:pane (:pane start) :last (screen-state start)
@@ -795,7 +836,7 @@
         text (some-> (:text opts) str/trim not-empty)]
     (if-not text
       (fail! state :no-text {})
-      (when-let [ready (start-row h state ref opts)]
+      (when-let [ready (start-row h state ref (assoc opts :refuse-input? true))]
         (when (deliver! h state ref (:pane ready) text :say (assoc opts :input-timeout-ms 0))
           (let [started (poll/wait-until h ref :busy? opts (:start-timeout-ms opts))]
             (swap! state assoc :status :done :delivered true
