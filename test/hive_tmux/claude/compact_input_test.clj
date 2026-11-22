@@ -35,7 +35,7 @@
       (is (= [draft] (:human-sent @state)) "the human's own text went out as theirs")
       (is (= ["/compact" "hive workflow catchup /caveman"] (:sent @state)))
       (is (some #(= :wait-input (:step %)) (:steps job)))
-      (is (contains? @seen-waiting {:pending-human-input draft :during :compact})
+      (is (contains? @seen-waiting {:human-typing draft :during :compact})
           "while it waits, the job says what it waits on")
       (is (nil? (:waiting-on job)) "and says nothing once the wait is over"))))
 
@@ -60,7 +60,7 @@
   (let [{:keys [state host]} (ct/scripted-host {:tokens 450000 :goal? false})]
     (swap! state assoc :human draft)
     (let [job (compact/start! "%9" (assoc ct/fast :host host :input-timeout-ms 30000))]
-      (is (= [:skipped :pending-human-input] [(:status job) (:reason job)]))
+      (is (= [:skipped :human-typing] [(:status job) (:reason job)]))
       (is (= {:during :compact :pane "%9" :name "peer one" :input draft :waited-ms 30000}
              (select-keys (:error job) [:during :pane :name :input :waited-ms])))
       (is (str/includes? (get-in job [:error :hint]) "%9"))
@@ -74,13 +74,13 @@
     (let [{:keys [state host]} (ct/scripted-host {:tokens 450000 :goal? false})]
       (swap! state assoc :human draft)
       (let [job (compact/start! "%9" (assoc ct/fast :host host :input-timeout-ms 0))]
-        (is (= :pending-human-input (:reason job)))
+        (is (= :human-typing (:reason job)))
         (is (not-any? #(= :wait-input (:step %)) (:steps job))))))
   (testing "goal with wait-idle? false does not wait on a draft"
     (let [{:keys [state host]} (ct/scripted-host {:tokens 100000 :goal? false})]
       (swap! state assoc :human draft)
       (let [job (compact/start! "%9" (assoc ct/fast :host host :kind :goal :goal "Next card." :wait-idle? false))]
-        (is (= [:skipped :pending-human-input] [(:status job) (:reason job)]))
+        (is (= [:skipped :human-typing] [(:status job) (:reason job)]))
         (is (zero? (:clock @state)))))))
 
 (deftest the-composer-must-hold-a-slash-command-before-enter

@@ -231,7 +231,7 @@
     (swap! state assoc :human "hive workflow catchup /caveman")
     (let [job (compact/start! "%9" (assoc fast :host host))]
       (is (= :skipped (:status job)))
-      (is (= :pending-human-input (:reason job)))
+      (is (= :human-typing (:reason job)))
       (is (= "hive workflow catchup /caveman" (get-in job [:error :input])))
       (is (empty? (:sent @state)) "not one key was sent")
       (is (not-any? #(= "send-keys" (first %)) (:argv @state))))))
@@ -267,7 +267,7 @@
   (let [{:keys [state host]} (scripted-host {:tokens 100000 :goal? false})]
     (swap! state assoc :human "half a sentence")
     (let [job (compact/start! "%9" (assoc fast :host host :kind :say :text "hello"))]
-      (is (= [:skipped :pending-human-input] [(:status job) (:reason job)]))
+      (is (= [:skipped :human-typing] [(:status job) (:reason job)]))
       (is (empty? (:sent @state))))))
 
 (deftest goal-arms-a-goal-without-compacting
@@ -305,7 +305,7 @@
     (let [{:keys [state host]} (scripted-host {:tokens 100000 :goal? false})]
       (swap! state assoc :human "half" :ghost " a sentence")
       (let [job (compact/start! "%9" (assoc fast :host host :kind :say :text "hello"))]
-        (is (= [:skipped :pending-human-input] [(:status job) (:reason job)]))
+        (is (= [:skipped :human-typing] [(:status job) (:reason job)]))
         (is (= "half a sentence" (get-in job [:error :input])) "dim beside typed text is input too")
         (is (empty? (:sent @state))))))
   (testing "voice-dictation interim text (all dim) stops it while dictation shows (review F1)"
@@ -313,7 +313,7 @@
       (swap! state assoc :ghost "please stop the deploy" :voice true)
       (doseq [opts [{:kind :say :text "hello"} {}]]
         (let [job (compact/start! "%9" (merge fast {:host host} opts))]
-          (is (= [:skipped :pending-human-input] [(:status job) (:reason job)]) (pr-str opts))
+          (is (= [:skipped :human-typing] [(:status job) (:reason job)]) (pr-str opts))
           (is (= "please stop the deploy" (get-in job [:error :input])))))
       (is (empty? (:sent @state))))))
 

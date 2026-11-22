@@ -385,7 +385,7 @@
               :doc "Arm or replace a pane's /goal WITHOUT compacting: goal=<text> replaces, goal_append=<text> extends the active one. Never waits for idle: Claude Code accepts /goal while a turn runs, so a busy /goal pane is set at once. A menu or permission dialog stops it :skipped :dialog (answer it with `tmux answer`); text at the prompt is waited out up to input_timeout_ms (not with wait_idle=false). Done only once the footer shows this goal active, else failed :goal-unconfirmed. Background job; job ends with goal-active-after?."
               :params [:pane :goal :goal_append :wait_idle :input_timeout_ms :supersede :socket_name]}
    "say"     {:fn say-cmd
-              :doc "Submit one prompt (text=) to a pane. Waits for a settled idle unless wait_idle=false; refuses (skipped, pending-human-input) when the prompt line holds text. Job is done once the pane starts on it; read the answer later with `tmux read`."
+              :doc "Submit one prompt (text=) to a pane. Waits for a settled idle unless wait_idle=false; refuses (skipped, reason human-typing) when the prompt line holds text, and (skipped, reason open-dialog) while a menu or permission dialog is open or the session is :waiting; nothing lifts either. Job is done once the pane starts on it; read the answer later with `tmux read`."
               :params [:pane :text :wait_idle :supersede :socket_name]}
    "read"    {:fn read-cmd
               :doc "Read a Claude or Codex pane's last N screen lines (lines, default 40). Claude may include transcript last_assistant and strip_chrome (both default true). Codex returns terminal text without Claude parsing, transcript attribution or inferred busy/input state."
@@ -453,7 +453,7 @@
    "exclude"      {:anyOf [{:type "array" :items {:type "string"}} {:type "string"}] :description "[tmux compact|watch start] Pane refs to skip (e.g. your own pane): a JSON array, a comma-separated string or one ref."}
    "force"        {:type "boolean" :description "[tmux compact] Compact even under threshold."}
    "dry_run"      {:type "boolean" :description "[tmux compact] List what would be compacted; start nothing."}
-   "input_timeout_ms" {:type "integer" :description "[tmux compact|goal] How long text someone left at the prompt is waited out before the job skips as pending-human-input (default 600000; 0 skips at once)."}
+   "input_timeout_ms" {:type "integer" :description "[tmux compact|goal] How long text someone left at the prompt is waited out before the job skips as human-typing (default 600000; 0 skips at once). force=true never lifts it."}
    "between_turns" {:type "string" :description "[tmux compact] How rest is proven: auto (default) reads a /goal-active pane at its single turn boundary and every other pane at a settled idle; true forces the turn boundary, false forces the settled idle."}
    "include_goal" {:type "boolean" :description "[tmux panes] Also read each goal-active pane's /goal text."}
    "socket_name"  {:type "string" :description "[tmux panes|compact] tmux -L socket; default server when omitted."}
