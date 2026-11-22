@@ -7,6 +7,8 @@
      :sense/context-high   a pane crossed the watch threshold upward
      :sense/pane-waiting   a pane waits on a human (permission or other prompt)
      :sense/tmux-job       a compact | say | goal job ended (detail job_status)
+     :sense/compact-ready  a pane may be compacted: high, idle, empty prompt,
+                           no dialog, and its coordinator wrapped
      :sense/idle-capacity  a coordinator idle > 10 min with no working ling and
                            open cards (detail coordinator, idle_ms, live_lings,
                            open_cards; hive-tmux.claude.idle-capacity)
@@ -31,6 +33,7 @@
    :context-high :sense/context-high
    :pane-waiting :sense/pane-waiting
    :tmux-job     :sense/tmux-job
+   :compact-ready :sense/compact-ready
    :idle-capacity :sense/idle-capacity})
 
 (def ^:private docs
@@ -39,6 +42,9 @@
    :context-high "A Claude Code pane's context crossed the watcher's threshold upward."
    :pane-waiting "A Claude Code pane is waiting on a human: a permission prompt or another question (session status :waiting)."
    :tmux-job     "A swarm tmux compact | say | goal job ended; detail job_status says how."
+   :compact-ready (str "A Claude Code pane may be compacted now: context over the threshold, idle, an empty prompt,"
+                       " no dialog, and its coordinator shouted WRAPPED or updated its hand-off after the crossing"
+                       " (detail ready_by, handoff_id). Matched by session id, never by pane.")
    :idle-capacity (str "A coordinator pane (matched by session id) has been idle over 10 min with no working "
                        "ling under it in the pulse while its board holds open todo or doing cards: "
                        "coordinators never sit back (axiom 20261003154522-36473755).")})
@@ -63,6 +69,8 @@
    :tmux-job-kind   "job_kind"
    :tmux-job-status "job_status"
    :tmux-job-reason "job_reason"
+   :tmux-ready-by   "ready_by"
+   :tmux-handoff-id "handoff_id"
    :tmux-coordinator "coordinator"
    :tmux-idle-ms    "idle_ms"
    :tmux-live-lings "live_lings"
