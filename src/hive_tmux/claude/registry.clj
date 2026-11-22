@@ -20,7 +20,8 @@
             [hive-tmux.claude.sense :as sense]
             [hive-tmux.claude.interrupt :as interrupt]
             [hive-tmux.claude.answer :as answer]
-            [clojure.edn :as edn]))
+            [clojure.edn :as edn]
+            [hive-tmux.claude.caller :as caller]))
 
 ;; Copyright (C) 2026 Pedro Gomes Branquinho (BuddhiLW) <pedrogbranquinho@gmail.com>
 ;;
@@ -139,9 +140,17 @@
           (let [pid (parse-long digits)] (when (pos? pid) pid)))))))
 
 (defn own-pane?
-  "Does ROW show the session of the caller whose pid is PID?"
-  [row pid]
-  (boolean (and pid (number? (:pid row)) (= pid (long (:pid row))))))
+  "Does ROW show the caller's session? TOKEN is a `caller/caller-token`
+   ({:pid n} or {:session-token s}) or a bare pid (`caller-pid`)."
+  [row token]
+  (caller/own-pane? row token))
+
+(defn- caller-refusal
+  "The fail-closed refusal of COMMAND for a caller id that names nothing
+   (`caller/identity-of` :unresolvable), or nil."
+  [ident command]
+  (when-let [id (:unresolvable ident)]
+    (r/err :tmux/unresolvable-caller (caller/unresolvable-error id command))))
 
 (def self-compact
   "Where the caller compacts its own pane instead."
@@ -164,10 +173,14 @@
    would cancel queued jobs on every due pane."
   [params]
   (let [exclude-r (pane-refs (:exclude params))
-        refs-r (pane-refs (:pane params))]
+        refs-r (pane-refs (:pane params))
+        ident (caller/identity-of (:_caller_id params))]
     (cond
       (r/err? exclude-r) (assoc exclude-r :param :exclude)
       (r/err? refs-r) (assoc refs-r :param :pane)
+      ;; Fail closed: a coordinator id that names nothing cannot be told
+      ;; apart from the owner of any pane (card 20261122175413-3d66aa77).
+      (:unresolvable ident) (caller-refusal ident :compact)
 
       (and (bool (:supersede params) false) (nil? (:ok refs-r)))
       (r/err :tmux/supersede-needs-pane
@@ -181,7 +194,7 @@
             exclude (set (:ok exclude-r))
             rows (panes/panes h {:provider :all})
             refs (:ok refs-r)
-            me (caller-pid (:_caller_id params))
+            me (:token ident)
             matched (if refs
                       (keep (fn [ref] (some #(when (some #{ref} (refs-of %)) %) rows)) refs)
                       (filter #(and (= :claude (:provider %))
@@ -367,7 +380,10 @@
       (< 1 (count rows))
       (r/err :tmux/ambiguous-pane {:pane ref :matches (mapv #(select-keys % [:pane :target :name]) rows)
                                    :hint "name the pane by its %id"})
-      (own-pane? row (caller-pid caller))
+      (:unresolvable (caller/identity-of caller))
+      (caller-refusal (caller/identity-of caller) :answer)
+
+      (own-pane? row (:token (caller/identity-of caller)))
       (r/err :tmux/own-pane {:pane (:pane row) :name (:name row)
                              :why "a session never answers its own menu or permission dialog"})
       (not (contains? (:capabilities row) :answer))
