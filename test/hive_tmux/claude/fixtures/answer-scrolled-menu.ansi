@@ -1,0 +1,10 @@
+  Which card should the agent take?
+  ↑ 2 earlier options
+  3. Inspect the transcript
+  4. Repair the parser
+❯ 5. Answer the pending question
+     Resolve the ask and let the existing job continue.
+  6. Run the complete unit suite
+  7. Stop and report
+  ↓ 1 later option
+  Enter to select · ↑/↓ to navigate · Esc to cancel

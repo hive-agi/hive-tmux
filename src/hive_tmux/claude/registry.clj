@@ -19,6 +19,7 @@
             [hive-tmux.claude.screen :as screen]
             [hive-tmux.claude.sense :as sense]
             [hive-tmux.claude.interrupt :as interrupt]
+            [hive-tmux.claude.answer :as answer]
             [clojure.edn :as edn]))
 
 ;; Copyright (C) 2026 Pedro Gomes Branquinho (BuddhiLW) <pedrogbranquinho@gmail.com>
@@ -327,6 +328,48 @@
 
 (defn watch-status-cmd [_] (r/ok (watch/status)))
 
+(defn- strict-true?
+  "Only boolean true or the string \"true\" (any case, trimmed) enables a
+   consent flag; \"off\", \"\", \"yes\" and everything else are false."
+  [x]
+  (or (true? x) (and (string? x) (= "true" (str/lower-case (str/trim x))))))
+
+(defn answer-cmd
+  "Pick an option in the menu a Claude pane is already showing. An immediate
+   input operation, not a background job; a queued or running job on the pane
+   is kept and the answer noted in its steps. The caller must be identified
+   (`_caller_id`), must not be the pane's own session, and must name exactly
+   one pane. Permission dialogs and standing grants are gated in
+   `answer/answer!`."
+  [params]
+  (let [h (h-of params)
+        ref (some-> (:pane params) str str/trim not-empty)
+        option (some-> (:option params) str str/trim not-empty)
+        caller (some-> (:_caller_id params) str str/trim not-empty)
+        rows (when ref (filterv #(some #{ref} (refs-of %)) (panes/panes h {:provider :all})))
+        row (first rows)]
+    (cond
+      (nil? ref) (r/err :tmux/no-pane {:hint pane-hint})
+      (nil? option) (r/err :tmux/no-option {:hint "option=<number|label>"})
+      (nil? caller) (r/err :tmux/no-caller {:hint "answer needs an identified caller (_caller_id)"})
+      (empty? rows) (r/err :tmux/no-such-pane {:pane ref})
+      (< 1 (count rows))
+      (r/err :tmux/ambiguous-pane {:pane ref :matches (mapv #(select-keys % [:pane :target :name]) rows)
+                                   :hint "name the pane by its %id"})
+      (own-pane? row (caller-pid caller))
+      (r/err :tmux/own-pane {:pane (:pane row) :name (:name row)
+                             :why "a session never answers its own menu or permission dialog"})
+      (not (contains? (:capabilities row) :answer))
+      (r/err :tmux/unsupported-provider {:pane ref :provider (:provider row) :command :answer
+                                        :capabilities (:capabilities row)})
+      :else (let [{:keys [error] :as result}
+                  (answer/answer! h row option
+                                  (cond-> {:actor caller
+                                           :permission? (strict-true? (:permission params))}
+                                    (some? (:expect params)) (assoc :expect (str (:expect params)))))
+                  error (when error (if (namespace error) error (keyword "tmux" (name error))))]
+              (if error (r/err error (dissoc result :error)) (r/ok result))))))
+
 (def subcommands
   {"panes"   {:fn panes-cmd
               :doc "Claude Code and Codex panes as data with provider and capabilities. pane_provider=all (default), claude or codex. Claude rows include session, context, busy/input and optional goal facts; Codex rows expose terminal identity with status unknown and read-screen capability only. Titles do not identify a Codex task. include_goal=true reads Claude goals."
@@ -346,6 +389,9 @@
    "read"    {:fn read-cmd
               :doc "Read a Claude or Codex pane's last N screen lines (lines, default 40). Claude may include transcript last_assistant and strip_chrome (both default true). Codex returns terminal text without Claude parsing, transcript attribution or inferred busy/input state."
               :params [:pane :lines :strip_chrome :last_assistant :socket_name]}
+   "answer"  {:fn answer-cmd
+              :doc "Answer the Claude Code menu on pane=<%id> (a ref matching two panes is refused). option=<n|label>: printed number or exact label. Only a menu read positively (one ❯ row, consecutive numbers, a selection footer, no composer below) is answered; a checkbox menu is refused. Anything not positively an AskUserQuestion menu is a permission dialog: refused with its question and options to relay via `swarm ask`, answered only with permission=true and expect=<text in the dialog>. \"Don't ask again\" / \"allow all ... this session\" options are always refused, as are your own pane and a call without _caller_id. Sends the arrows, re-reads the pane, sends Enter only when the same menu shows with the highlight on the choice (else :menu-changed with keys sent); after Enter reports delivered? true, confirmed? and any next-menu. Every attempt is appended to ~/.local/state/hive-tmux/answers.edn and to an active pane job's steps; no job is started."
+              :params [:pane :option :permission :expect :socket_name]}
    "watch start" {:fn watch-start-cmd
                   :doc "Watch every Claude pane server-side and shout changes to parent=<agent id> as sixth-sense senses: pane-idle, goal-ended, context-high (threshold, default 400000) and tmux-job (a compact|say|goal job ended). Then `swarm ss wait` instead of polling. interval_ms default 5000; exclude=<refs> (your own pane)."
                   :params [:parent :threshold :interval_ms :exclude :socket_name]}
@@ -422,7 +468,10 @@
    "interrupt"    {:type "string" :enum ["auto" "true" "false"] :description "[tmux compact] Cut into a working turn that never reaches rest (a /goal pane looping on ss wait). auto (default): only on a pane whose /goal was active when the job began, after interrupt_after_ms without rest, while a read-only wait (ss wait, await, sleep) or no tool runs. true: also without a goal or wait, and for an unclassified tool. false: never. Never while a write runs (git, ship land, kubectl apply ...) or text stands at the prompt."}
    "interrupt_after_ms" {:type "integer" :description "[tmux compact] How long interrupt=auto waits for rest before it may cut in (default 300000)."}
    "interrupt_via" {:type "string" :enum ["force-send" "escape"] :description "[tmux compact] force-send (default): type /compact, which Claude Code queues, then C-x C-s to send it now; the running tool moves to the background, not killed. escape: Esc until the turn stops (kills the tool call), then /compact."}
-   "supersede"    {:type "boolean" :description "[tmux compact|say|goal] Cancel the pane's queued job if it has not typed yet and take its slot (default false: refuse :already-running naming it)."}})
+   "supersede"    {:type "boolean" :description "[tmux compact|say|goal] Cancel the pane's queued job if it has not typed yet and take its slot (default false: refuse :already-running naming it)."}
+   "option"       {:type "string" :description "[tmux answer] Printed option number (1-based) or exact option label in the current Claude Code menu."}
+   "permission"   {:type "boolean" :description "[tmux answer] Answer a dialog that is not positively an AskUserQuestion menu (a permission dialog). Only after the operator said yes through `swarm ask`; needs expect."}
+   "expect"       {:type "string" :description "[tmux answer] Text from the question or dialog body you read; the answer is refused unless the live menu still shows it. Required with permission=true."}})
 
 
 (def addon-key

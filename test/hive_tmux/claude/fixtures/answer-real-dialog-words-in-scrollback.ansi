@@ -1,0 +1,23 @@
+     :"working","idle-ms":100321,"turn":46,"tools":["swarm"],"project":"hive-assay","task":"You are
+     the lead (reviewer and lander, on Opus) for card ASSAY-RUN-ONE (20261006235652-1866bb4d), STEP
+     (3): move lab\/carto
+     run-trial!\/run-cell!\/run-pool!\/run-gr\u2026"},{"agent":"run-grid-3-impl2","state":"working","
+     idle-ms":58748,"turn":28,"tools":["carto"],"project":"hive-assay","task":"Resume ASSAY-RUN-ONE
+     step 3 per .claude\/BRIEF-run-grid-3-design.md in the worktree; commit, no push; short
+     report."},{"agent":"spi-review-fable-2","state":"working","idle-ms":143620,"turn":16,"project":"
+     autonomous","task":"Resume of spi-review-fable (landing review of autonomous feat\/surface-spi
+     PR #20). Follow the resume prompt: write the final report now."},{"agent":"tmux:hive catchup
+     toolsearch preload","state":"tmux-job","idle-ms":56273}]}
+
+[38;5;246m●[39m [1mBash[0m(for p in %1 %2 %3 %4 %5 %8; do echo "== $p"; tmux capture-pane -p -t "$p" | grep -v '^\s*$' |
+  tail -6 | grep -nE 'Do you want to proceed|❯ 1\.|Esc to cancel' || echo "no dialog"; done; grep -E
+  'MemAvailable' /proc/meminfo; uptime)
+[38;5;246m  ⎿  Running…[39m
+
+[38;5;174m✽[39m [38;5;180mWorking…[38;5;174m [38;5;246m(1m 6s · ↓[39m [38;5;246m904 tokens · thought for 2s)[39m
+[38;5;246m  ⎿  Tip: Use /btw to ask a side question without interrupting Claude[39m
+                            [38;5;246m111059 tokens ·[39m [38;5;246mcurrent: 2.1.328 · la…[39m [38;5;114m✔ Update installed · Restart to…[39m
+[38;5;244m────────────────────────────────────────────────[39m [2m◉ xhigh · /effort[0m [38;5;244m hive catchup toolsearch preload ─
+[38;5;246m❯ [39m
+[38;5;244m─────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246m-- INSERT --[39m [38;5;220m⏵⏵ auto mode on[38;5;246m (shift+tab to cycle) · ← 43 agents[39m
