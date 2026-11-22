@@ -183,15 +183,66 @@
       {:reason :under-threshold :ctx-tokens (:ctx-tokens row) :threshold (:threshold opts)}
       (and (#{:say :goal} kind) (false? (:wait-idle? opts)) (not (idle? row))) {:reason :busy})))
 
+(defn unsent-after
+  "The sends JOB planned after its /compact (:sends-planned, [{:step k
+   :text t}]) that no step records as sent: [[k text] ...], in order."
+  [job]
+  (let [planned (:sends-planned job)
+        ks (set (map :step planned))
+        sent (set (keep #(when (and (ks (:step %)) (:sent %)) (:step %)) (:steps job)))]
+    (vec (keep (fn [{:keys [step text]}] (when-not (sent step) [step text])) planned))))
+
+(defn compacted-end
+  "JOB, which recorded :compacted, stopped by a LATER step: :done all the
+   same, since the compaction is what the job is for (friction
+   20261121201539-4a5836cb). REASON says why the rest did not go out; STOP,
+   what that step would have failed or skipped with, is kept under
+   :advisory, never as an :error; LAST is the pane's screen state (else
+   STOP's :last). The texts not typed are under :unsent, :reseed-pending and
+   :goal-pending name which. A goal the pane shows active is not pending:
+   it is in force."
+  ([job reason stop] (compacted-end job reason stop nil))
+  ([job reason stop last]
+   (let [unsent (unsent-after job)
+         ks (set (map first unsent))
+         last (or last (:last stop))
+         goal-active? (:goal-active? last)]
+     (cond-> (-> job (assoc :status :done :reason reason) (dissoc :error))
+       stop (assoc :advisory stop)
+       (seq unsent) (assoc :unsent (mapv second unsent))
+       (ks :reseed) (assoc :reseed-pending true)
+       (and (ks :goal-restored) (not (:goal-in-force stop))) (assoc :goal-pending true)
+       (some? goal-active?) (assoc :goal-active-after? goal-active?)
+       last (assoc :last last)
+       (:ctx-tokens last) (assoc :tokens-after (:ctx-tokens last))))))
+
+(defn after-compact-reason
+  "The :done reason of a compacted job that a later step stopped with REASON
+   and DATA (`compacted-end`): a pane that stayed busy (:timeout or :busy)
+   during step S reads :pane-busy-after-S; any other reason is kept."
+  [reason {:keys [during]}]
+  (if (and (#{:timeout :busy} reason) during)
+    (keyword (str "pane-busy-after-" (name during)))
+    reason))
+
 ;;; Pipeline
 
 (defn- step! [state k data]
   (swap! state update :steps conj (assoc data :step k))
   (log/debug "[claude-compact]" k data))
 
-(defn- fail! [state reason data]
-  (swap! state assoc :status :failed :reason reason :error data)
+(defn- stop!
+  "End the job STATUS (:failed or :skipped) for REASON with DATA, unless it
+   already recorded :compacted: then what stops it is advisory and it ends
+   :done (`compacted-end`). Nil."
+  [state status reason data]
+  (if (:compacted? @state)
+    (swap! state compacted-end (after-compact-reason reason data) (assoc data :reason reason))
+    (swap! state assoc :status status :reason reason :error data))
   nil)
+
+(defn- fail! [state reason data]
+  (stop! state :failed reason data))
 
 (defn- timeout!
   "Fail as :timeout DURING STEP-KEY, naming what the step waited for (DATA)
@@ -228,12 +279,13 @@
       (not row)
       (let [end (or (poll/observe h ref) row0)
             input (or (:input end) (:input row0))]
-        (swap! state assoc :status :skipped :reason (if input :pending-human-input :busy)
-               :error (cond-> {:during step-key :pane pane-id :name (:name end)
-                               :waited-ms wait-ms :last (screen-state end)}
-                        input (assoc :input input
-                                     :hint (str "Text stands at the prompt of " pane-id " and was not typed over. "
-                                                "Send or clear it, then start the job again."))))
+        ;; After the compaction this is advisory: the job ends :done (`stop!`).
+        (stop! state :skipped (if input :pending-human-input :busy)
+               (cond-> {:during step-key :pane pane-id :name (:name end)
+                        :waited-ms wait-ms :last (screen-state end)}
+                 input (assoc :input input
+                              :hint (str "Text stands at the prompt of " pane-id " and was not typed over. "
+                                         "Send or clear it, then start the job again."))))
         false)
 
       (cancelled? (swap! state claim-typing step-key)) false
@@ -246,16 +298,24 @@
                  {:during step-key :pane pane-id :expected text :composer composer
                   :hint "Enter was not pressed: the composer does not hold the command as typed. Clear it, then start the job again."}))))))
 
-(defn- send-and-settle!
-  "Send TEXT, wait for the turn it starts to end. Returns the idle row, or nil
-   when it stopped (status is set). For an intermediate step: the next send
-   must not land on a working pane."
-  [h state ref pane-id text step-key opts]
-  (when (deliver! h state ref pane-id text step-key opts)
+(defn- reseed-and-settle!
+  "Send the re-seed TEXT, an intermediate step, and wait for the turn it
+   starts to end, so the next send does not land on a working pane.
+   {:idle row} at rest. With GOAL-OK? (the goal the job
+   would restore is the one the pane had), a pane that shows its /goal
+   active ends the wait at once as {:goal-in-force row}: the goal is still
+   set, its Stop hook keeps the pane working, and a turn boundary may never
+   come (friction 20261121201539-4a5836cb). Nil when it stopped (status is
+   set; after a compaction that is :done, see `stop!`)."
+  [h state ref pane-id text goal-ok? opts]
+  (when (deliver! h state ref pane-id text :reseed opts)
     ;; The turn may start and end between two polls; seeing busy is not required.
     (poll/wait-until h ref :busy? opts (:start-timeout-ms opts))
-    (or (poll/wait-rest h ref poll/idle? opts (:step-timeout-ms opts))
-        (timeout! h state ref step-key {:waited-for (poll/waited-for opts)}))))
+    (let [in-force? #(boolean (and goal-ok? (:goal-active? %)))
+          row (poll/wait-rest h ref #(or (poll/idle? %) (in-force? %)) opts (:step-timeout-ms opts))]
+      (cond (nil? row) (timeout! h state ref :reseed {:waited-for (poll/waited-for opts)})
+            (poll/idle? row) {:idle row}
+            :else {:goal-in-force row}))))
 
 (defn- send-and-start!
   "Send TEXT as a job's LAST step and end on the pane's acknowledgement: seen
@@ -458,6 +518,16 @@
    and the texts it did not type under :unsent: the recycle worked, and typing
    into a working pane is what this job never does.
 
+   ONCE :compacted IS RECORDED THE JOB CANNOT FAIL. Every later wait for rest
+   is advisory (`stop!`, `compacted-end`): a pane still busy after the
+   re-seed, because the /goal is still in force and its Stop hook leaves no turn
+   boundary, ends :done :pane-busy-after-reseed. What the step would have
+   failed with is kept under :advisory, the texts not typed go under :unsent,
+   and :reseed-pending / :goal-pending say which (friction
+   20261121201539-4a5836cb: cc-04c4ee28 and cc-804a41e1 compacted 463k ->
+   151k, then ended `failed timeout`). A job that never compacted still
+   fails as before.
+
    REST: see the namespace docstring. Nothing here lands on a running turn."
   [h state ref opts]
   (let [opts (-> (merge defaults opts)
@@ -498,7 +568,8 @@
                 ;; The goal is read while the turn still runs, before any key.
                 _ (do (step! state :goal-captured {:captured captured :goal goal
                                                    :goal-active? (:goal-active? ready)})
-                      (swap! state assoc :goal goal)
+                      (swap! state assoc :goal goal
+                             :sends-planned (mapv (fn [[t k]] {:step k :text t}) sends))
                       (when (and (:goal-active? ready) (:restore-goal? opts) (nil? captured) (nil? (:goal opts)))
                         (let [note (str "The /goal is active but its text is in neither a /goal entry nor a goal_status "
                                         "entry of the session transcript, so it will NOT be restored after /compact. "
@@ -527,21 +598,33 @@
                                                           #(force-send! h state pane-id text ready verdict)))]
               (cond
                 (and (nil? row) (seq sends))
-                (swap! state assoc :status :done :reason :pane-busy-after-compact
-                       :unsent (mapv first sends) :last (screen-state (poll/observe h ref)))
+                (swap! state compacted-end :pane-busy-after-compact nil (screen-state (poll/observe h ref)))
 
                 ;; The last send restarts work: it ends the job once acknowledged.
                 :else
-                (let [last-send (peek sends)]
-                  (when (or (< (count sends) 2)
-                            (send-and-settle! h state ref pane-id reseed :reseed opts))
-                    (if-let [[text k] last-send]
+                (let [last-send (peek sends)
+                      settled (when (>= (count sends) 2)
+                                (reseed-and-settle! h state ref pane-id reseed (= goal captured) opts))]
+                  (cond
+                    ;; The goal outlived /compact and keeps the pane working:
+                    ;; nothing is left to restore, and nothing is typed into it.
+                    (:goal-in-force settled)
+                    (swap! state compacted-end :pane-busy-after-reseed
+                           {:during :reseed :waited-for (poll/waited-for opts) :goal-in-force true}
+                           (screen-state (:goal-in-force settled)))
+
+                    (and (>= (count sends) 2) (nil? settled)) nil
+
+                    last-send
+                    (let [[text k] last-send]
                       (when-let [{:keys [started? row]} (send-and-start! h state ref pane-id text k opts)]
                         (swap! state assoc :status :done :started? started?
-                               :tokens-after (:ctx-tokens row) :goal-active-after? (:goal-active? row)))
-                      (let [end (poll/observe h ref)]
-                        (swap! state assoc :status :done :tokens-after (:ctx-tokens end)
-                               :goal-active-after? (:goal-active? end))))))))))))
+                               :tokens-after (:ctx-tokens row) :goal-active-after? (:goal-active? row))))
+
+                    :else
+                    (let [end (poll/observe h ref)]
+                      (swap! state assoc :status :done :tokens-after (:ctx-tokens end)
+                             :goal-active-after? (:goal-active? end)))))))))))
     @state))
 
 (defn- start-row
