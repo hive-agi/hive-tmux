@@ -44,7 +44,8 @@
    [:activity [:maybe :string]]
    [:input [:maybe :string]]
    [:suggestion [:maybe :string]]
-   [:queued {:optional true} [:maybe [:vector :string]]]])
+   [:queued {:optional true} [:maybe [:vector :string]]]
+   [:dialog {:optional true} [:maybe :map]]])
 
 (def queued-marker
   "What Claude Code 2.1.330 draws under the last message submitted while a
@@ -335,6 +336,42 @@
                          [] block)]
         (not-empty (filterv seq msgs))))))
 
+(declare rule-line?)
+
+(def dialog-marks
+  "Controls Claude Code draws at the bottom of the screen for a real choice,
+   never for a conversational sentence such as `needs input: ...`. Matched
+   lower-cased. 2.1.329 draws `Esc to cancel · Tab to amend` (permission),
+   `Enter to select · ↑/↓ to navigate · Esc to cancel` (AskUserQuestion) and
+   `Enter to confirm · Esc to cancel` (folder trust); see the recorded-*.ansi
+   fixtures."
+  ["esc to cancel" "enter to confirm" "enter to select" "to navigate"])
+
+(defn composer-box?
+  "Does LINES (escapes stripped) show Claude Code's open composer: a `❯` row
+   whose next line is a rule? A dialog REPLACES the composer, and a `❯` in
+   scrollback, a queued message or a menu row is never followed by a rule."
+  [lines]
+  (let [v (vec lines)]
+    (boolean (some (fn [i] (and (prompt? (nth v i)) (rule-line? (nth v (inc i)))))
+                   (range (max 0 (dec (count v))))))))
+
+(defn dialog-of
+  "The menu or permission dialog LINES (a capture, escapes kept or not)
+   shows, or nil: {:kind :menu :evidence mark :lines [line]}. A dialog draws
+   its controls on its last line, so only the last 3 non-blank lines are read,
+   and never while the composer is open (`composer-box?`): reply text such as
+   `Needs input: ... Press Esc to cancel` sits above an open composer and is
+   conversation, not a dialog (friction 20261119234010-02a476db)."
+  [lines]
+  (let [lines (mapv strip-ansi lines)]
+    (when-not (composer-box? lines)
+      (some (fn [line]
+              (let [l (str/lower-case line)]
+                (when-let [mark (some #(when (str/includes? l %) %) dialog-marks)]
+                  {:kind :menu :evidence mark :lines [(utrim line)]})))
+            (take-last 3 (filter (comp seq utrim) lines))))))
+
 (defn read-screen
   "The facts of LINES, a pane capture top to bottom, escapes kept (`tmux
    capture-pane -e`) or not. A screen with no prompt is `:claude? false` with
@@ -375,8 +412,9 @@
          :activity activity
          :input input
          :suggestion suggestion
-         :queued queued})
-      unread)))
+         :queued queued
+         :dialog (dialog-of lines)})
+      (assoc unread :dialog (dialog-of lines)))))
 
 (m/=> read-screen [:=> [:cat [:sequential :string]] Screen])
 

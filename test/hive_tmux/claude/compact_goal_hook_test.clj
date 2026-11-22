@@ -81,7 +81,9 @@
         type! (fn [text]
                 (swap! st (fn [s] (-> s
                                       (update :typed str text)
-                                      (cond-> (not (:rest? s))
+                                      ;; A /goal is accepted while a turn runs and
+                                      ;; is typed without rest (card 70541f83).
+                                      (cond-> (and (not (:rest? s)) (not (str/starts-with? text "/goal ")))
                                         (update :typed-while-busy inc))))))]
     {:state st
      :host

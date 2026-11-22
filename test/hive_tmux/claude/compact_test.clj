@@ -44,7 +44,13 @@
                   (swap! st (fn [s]
                               (-> (cond-> (-> s (update :sent conj line) (assoc :busy-polls 2 :typed ""))
                                     (str/starts-with? line "/compact") (assoc :tokens 30000 :goal? false)
-                                    (str/starts-with? line "/goal ") (assoc :goal? true)
+                                    (str/starts-with? line "/goal ")
+                                    (-> (assoc :goal? true)
+                                        (update :transcript (fnil conj [])
+                                                (json/write-str {:type "user"
+                                                                 :message {:role "user"
+                                                                           :content (str "<command-name>/goal</command-name>\n<command-args>"
+                                                                                         (subs line 6) "</command-args>")}})))
                                     (= line "hive workflow catchup /caveman") (update :tokens + 20000))
                                   (after-submit line)))))
         human-turn (fn [s]
@@ -134,8 +140,9 @@
                                                        (cond-> s (str/starts-with? line "/goal ")
                                                          (assoc :busy-polls 0 :goal? false)))})
         job (compact/start! "%9" (assoc fast :host host :kind :goal :goal "Take the next card."))]
-    (is (= :done (:status job)))
-    (is (false? (:started? job)) "the pane never showed it working nor the goal active")))
+    ;; Card 70541f83: a /goal is done only on its own footer, never on a
+    ;; delivery the pane did not acknowledge.
+    (is (= [:failed :goal-unconfirmed] [(:status job) (:reason job)]) "the footer never showed the goal")))
 
 (deftest under-threshold-is-skipped-unless-forced
   (let [{:keys [state host]} (scripted-host {:tokens 100000 :goal? false})]

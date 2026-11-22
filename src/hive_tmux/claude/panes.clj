@@ -179,6 +179,7 @@
              :vim-mode (:vim-mode facts)
              :input (:input facts)
              :suggestion (:suggestion facts)
+             :dialog (:dialog facts)
              :tty (not-empty (:tty pane))}
       ambiguous? (assoc :ambiguous? true)
       (nil? session) (assoc :unjoined? true))))

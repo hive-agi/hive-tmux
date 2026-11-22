@@ -1,0 +1,23 @@
+  Status:
+  1. The branch is rebased and its suite is green.
+  2. A review was requested on the open pull request.
+  3. Next: the refactor queue, then the documentation card.
+
+  This pane should be compacted and reseeded before I land anything,
+  since it is at about 381k tokens.
+
+
+
+
+
+
+
+
+
+
+[38;5;246m✻[39m [38;5;246mCrunched for 27s · done 05:10Z[39m
+                            [38;5;246m326716 tokens ·[39m [38;5;246mcurrent: 2.1.328 · la…[39m [38;5;114m✔ Update installed · Restart to…[39m
+[38;5;244m────────────────────────────────────────────────────[39m [2m◉ xhigh · /effort[0m [38;5;244m hive caveman plugin catchup ─
+[39m❯ 
+[38;5;244m─────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246m-- INSERT --[39m [38;5;220m⏵⏵ auto mode on[38;5;246m (shift+tab to cycle) · ← 43 agents[39m
