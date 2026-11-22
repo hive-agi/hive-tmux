@@ -34,7 +34,8 @@
             [hive-tmux.claude.idle-capacity :as idle-capacity]
             [hive-tmux.claude.panes :as panes]
             [hive-tmux.claude.ready :as ready]
-            [taoensso.timbre :as log]))
+            [taoensso.timbre :as log]
+            [hive-tmux.claude.caller :as caller]))
 
 ;; Copyright (C) 2026 Pedro Gomes Branquinho (BuddhiLW) <pedrogbranquinho@gmail.com>
 ;;
@@ -227,10 +228,16 @@
         {:keys [parent lease threshold start-job!]} opts
         now ((:now-ms host))
         lv (ready/lease-verdict ((:read lease)) parent now false)
-        fresh (some #(when (= (:pane %) (:pane row)) %) (pane-rows opts host))]
+        fresh (some #(when (= (:pane %) (:pane row)) %) (pane-rows opts host))
+        ;; The compactor's own pane, by the same fail-closed reading the verbs
+        ;; use (`caller/identity-of`, card 20261122175413-3d66aa77).
+        ident (caller/identity-of parent)]
     (cond
       (not (:ok? lv)) {:refused :lease-held :holder (:holder lv)}
-      (ready/own-row? row parent) {:refused :own-pane}
+      (:unresolvable ident) {:refused :unresolvable-caller :caller parent}
+      (or (ready/own-row? row parent)
+          (caller/own-pane? row (:token ident))
+          (caller/own-pane? fresh (:token ident))) {:refused :own-pane}
       (not= (:session-id fresh) (:session-id row)) {:refused :session-changed :now (:session-id fresh)}
       :else ((or start-job! compact/start!)
              (:pane fresh)
