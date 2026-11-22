@@ -312,16 +312,23 @@
       (is (= {:delivered? true :confirmed? false} (select-keys result [:delivered? :confirmed?]))))))
 
 (deftest answer-composes-with-a-real-queued-compaction-job
+  ;; A compact job refuses to START on a pane showing a menu (`open-dialog?`
+  ;; stops it :skipped :open-dialog, the S3 human-draft guard). The
+  ;; composition pinned here is the one that guard leaves: the job is already
+  ;; waiting when a menu opens. So the pane starts idle with no menu, the gate
+  ;; holds the job inside its first wait, and only then does the menu open
+  ;; and get answered.
   (let [entered (promise)
         released (promise)
         gate {:entered entered :released released}
-        {:keys [state host]} (scripted-host {:menu ask :highlight 2 :answered answered :gate gate})
+        {:keys [state host]} (scripted-host {:menu nil :highlight 2 :answered answered :gate gate})
         queued (compact/start! "%9" {:host host :force? true :reseed ""
                                      :poll-ms 1 :settle-ms 1})
         job-id (:job-id queued)
         before (compact/jobs)
         entered? (deref entered 10000 false)
         _ (is (true? entered?) "the real job is waiting, not merely scheduled")
+        _ (swap! state assoc :menu ask :highlight 2)
         answer-result (answer/answer! host {:pane "%9"} 1 {:actor "coordinator:400"})
         during (compact/job job-id)]
     (is (true? (:delivered? answer-result)) (pr-str answer-result))

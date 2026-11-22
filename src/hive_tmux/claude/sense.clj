@@ -9,6 +9,9 @@
      :sense/tmux-job       a compact | say | goal job ended (detail job_status)
      :sense/compact-ready  a pane may be compacted: high, idle, empty prompt,
                            no dialog, and its coordinator wrapped
+     :sense/idle-capacity  a coordinator idle > 10 min with no working ling and
+                           open cards (detail coordinator, idle_ms, live_lings,
+                           open_cards; hive-tmux.claude.idle-capacity)
 
    sixth-sense belongs to hive-agent, which this addon does not depend on, so
    its registry is resolved softly (the hive-elm pattern): without it the
@@ -30,7 +33,8 @@
    :context-high :sense/context-high
    :pane-waiting :sense/pane-waiting
    :tmux-job     :sense/tmux-job
-   :compact-ready :sense/compact-ready})
+   :compact-ready :sense/compact-ready
+   :idle-capacity :sense/idle-capacity})
 
 (def ^:private docs
   {:pane-idle    "A Claude Code pane that was working has settled idle (idle on two watcher ticks)."
@@ -40,7 +44,10 @@
    :tmux-job     "A swarm tmux compact | say | goal job ended; detail job_status says how."
    :compact-ready (str "A Claude Code pane may be compacted now: context over the threshold, idle, an empty prompt,"
                        " no dialog, and its coordinator shouted WRAPPED or updated its hand-off after the crossing"
-                       " (detail ready_by, handoff_id). Matched by session id, never by pane.")})
+                       " (detail ready_by, handoff_id). Matched by session id, never by pane.")
+   :idle-capacity (str "A coordinator pane (matched by session id) has been idle over 10 min with no working "
+                       "ling under it in the pulse while its board holds open todo or doing cards: "
+                       "coordinators never sit back (axiom 20261003154522-36473755).")})
 
 (defn class-specs []
   (for [[event cls] event->class]
@@ -64,7 +71,12 @@
    :tmux-job-reason "job_reason"
    :tmux-ready-by   "ready_by"
    :tmux-handoff-id "handoff_id"
-   :tmux-coordinator "coordinator"})
+   :tmux-coordinator "coordinator"
+   :tmux-idle-ms    "idle_ms"
+   :tmux-live-lings "live_lings"
+   :tmux-open-cards "open_cards"
+   :tmux-open-todo  "open_todo"
+   :tmux-open-doing "open_doing"})
 
 (defn soft-resolve [sym]
   (try (requiring-resolve sym) (catch Throwable _host-absent nil)))

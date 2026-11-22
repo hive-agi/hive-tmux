@@ -158,6 +158,7 @@
         lease (or (:lease o) (mem-lease nil))
         st (watch/start! (merge {:parent "coordinator:72216f39" :host (pane-host rows) :interval-ms 3600000
                                  :panes-fn (fn [_] @rows)
+                                 :idle-capacity? false ; stub ports only: no host pulse or board
                                  :shout-fn (fn [a e d] (swap! shouts conj [a e d]) true)
                                  :evidence-fn (fn [r] (when (= sid (:session-id r)) {:wrapped-at 10000000}))
                                  :silencer (fn [r] (swap! silenced conj (:session-id r)) {:ok true})

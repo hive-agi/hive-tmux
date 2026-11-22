@@ -21,6 +21,8 @@
                     With :auto-compact? the watcher, as the ONE compactor
                     (a host-wide lease), silences the wrapped coordinator's
                     wakers and compacts it, re-seeding with its hand-off.
+     :idle-capacity a coordinator session idle > 10 min, no working ling under
+                    it, open cards on its board (`hive-tmux.claude.idle-capacity`)
 
    The first tick only seeds: a pane already idle when the watch starts is not
    news. Every shout is addressed to :parent, the supervisor's agent id, which
@@ -29,6 +31,7 @@
             [hive-dsl.result :refer [guard]]
             [hive-tmux.claude.compact :as compact]
             [hive-tmux.claude.host :as host]
+            [hive-tmux.claude.idle-capacity :as idle-capacity]
             [hive-tmux.claude.panes :as panes]
             [hive-tmux.claude.ready :as ready]
             [taoensso.timbre :as log]))
@@ -37,7 +40,6 @@
 ;;
 ;; SPDX-License-Identifier: MIT
 
-(def defaults {:interval-ms 5000 :threshold 400000})
 (def defaults {:interval-ms 5000 :threshold 400000 :evidence-interval-ms 30000})
 
 ;;; Promote
@@ -237,14 +239,22 @@
 
 (defn tick!
   "One pass: read the panes and the coordinator evidence, step, shout every
-   event, and (auto-compact) silence and compact. Returns the events."
+   event, and (auto-compact) silence and compact. The idle-capacity sense
+   (`idle-capacity/step`) rides the same pane read, keyed by session id,
+   through the watcher's :idle-ports. Returns the events."
   [w]
-  (let [{:keys [host opts states]} @w
-        now ((:now-ms host))
+  (let [{:keys [host opts states ic-states]} @w
+        now ((or (:now-ms host) #(System/currentTimeMillis)))
         rows (pane-rows opts host)
         evidence (read-evidence w (evidence-wanted states rows opts) now)
-        {next-states :states events :events} (step states rows (assoc opts :now now :evidence evidence))]
-    (swap! w assoc :states next-states :last-tick (System/currentTimeMillis)
+        {next-states :states events :events} (step states rows (assoc opts :now now :evidence evidence))
+        ports (:idle-ports opts)
+        ic-now (if-let [f (:now-ms ports)] (f) now)
+        {ic-next :states ic-events :events}
+        (if ports
+          (idle-capacity/step ports ic-states rows ic-now (select-keys opts [:idle-ms :recheck-ms :exclude]))
+          {:states ic-states :events []})]
+    (swap! w assoc :states next-states :ic-states ic-next :last-tick (System/currentTimeMillis)
            :ticks (inc (:ticks @w 0)))
     (when (:auto-compact? opts)
       ((:write! (:lease opts)) {:owner (:parent opts) :renewed-ms now})
@@ -264,11 +274,15 @@
                    (:job-id r) (assoc :job-id (:job-id r))
                    (:refused r) (assoc :refused (:refused r))
                    (:error r) (assoc :error (:error r)))))))
-    events))
+    (doseq [[event row] ic-events]
+      (shout! opts event (merge (row-data row) (idle-capacity/event-data row)
+                                {:message (idle-capacity/message row)}))
+      (swap! w update-in [:fired event] (fnil inc 0)))
+    (into (vec events) ic-events)))
 
 (defn running? [] (boolean (some-> @watcher deref :running?)))
 
-(def ^:private port-keys [:host :shout-fn :evidence-fn :silencer :lease :start-job! :panes-fn])
+(def ^:private port-keys [:host :shout-fn :evidence-fn :silencer :lease :start-job! :panes-fn :idle-ports])
 
 (defn stop!
   "Stop the watcher, releasing the compactor lease it holds. Returns its last
@@ -282,7 +296,7 @@
         (let [{:keys [read write!]} (:lease opts)]
           (when (= (:parent opts) (:owner (guard Exception nil (read))))
             (guard Exception nil (write! nil))))))
-    (-> @w (dissoc :host :states :evidence-cache)
+    (-> @w (dissoc :host :states :ic-states :evidence-cache)
         (update :opts #(apply dissoc % port-keys)))))
 
 (defn start!
@@ -290,8 +304,10 @@
    addressed to; required), :threshold, :interval-ms, :exclude (refs),
    :auto-compact? (compact every compact-ready pane, as the ONE compactor:
    takes the host-wide lease, refused while another owner holds it fresh
-   unless :takeover?), and the ports :host :shout-fn :evidence-fn :lease
-   :silencer :start-job! (tests; the defaults read the host)."
+   unless :takeover?), :idle-ms / :recheck-ms (idle-capacity), :idle-ports
+   (the idle-capacity ports; default `idle-capacity/default-ports`),
+   :idle-capacity? false (turn that sense off), and the ports :host :shout-fn
+   :evidence-fn :lease :silencer :start-job! (tests; the defaults read the host)."
   [{:keys [parent auto-compact? takeover?] :as opts}]
   (when (str/blank? (str parent))
     (throw (ex-info "watch needs parent: the agent id that should hear the senses" {:type :tmux/no-parent})))
@@ -307,7 +323,9 @@
         (stop!)
         (let [opts (cond-> (merge defaults opts {:host host :lease lease})
                      (not (contains? opts :evidence-fn)) (assoc :evidence-fn (ready/host-evidence))
-                     (not (contains? opts :silencer)) (assoc :silencer (ready/host-silencer)))
+                     (not (contains? opts :silencer)) (assoc :silencer (ready/host-silencer))
+                     (and (not (contains? opts :idle-ports)) (not (false? (:idle-capacity? opts))))
+                     (assoc :idle-ports (idle-capacity/default-ports)))
               w (atom {:running? true :opts opts :host host
                        :states {} :started-at (System/currentTimeMillis) :ticks 0 :fired {}
                        :silenced [] :auto-compacts []})]
@@ -320,11 +338,11 @@
                      (swap! w assoc :last-error (.getMessage t))
                      (log/warn "[claude-watch] tick failed" (.getMessage t))))
               (Thread/sleep (long (:interval-ms opts)))))
-          (-> @w (dissoc :host :states) (update :opts #(apply dissoc % port-keys))))))))
+          (-> @w (dissoc :host :states :ic-states) (update :opts #(apply dissoc % port-keys))))))))
 
 (defn status []
   (if-let [w @watcher]
-    (-> @w (dissoc :host :evidence-cache) (update :states count)
+    (-> @w (dissoc :host :ic-states :evidence-cache) (update :states count)
         (update :opts #(apply dissoc % port-keys)) (assoc :running? true))
     {:running? false}))
 
