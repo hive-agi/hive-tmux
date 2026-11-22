@@ -1,0 +1,14 @@
+│ Support loop: pause for compaction? (rs01 is wrapped as hand-off 20261119205803-16ce2e04; lings ac01-dmerge,
+│ es-fe04-fix and cartas-ci-fix are still running.)
+
+❯ 1. Compact now
+     Compact this session. Reseed with catchup /caveman plus hand-off 16ce2e04 and resume card 1bcfb0b1.
+  2. Keep going
+     Keep following the lings and CI landings in this context.
+  3. Type something.
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+─────────────────────────────────────────────────────────────────────────────── hive caveman terse activation ─
+

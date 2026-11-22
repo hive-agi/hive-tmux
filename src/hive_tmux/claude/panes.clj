@@ -252,7 +252,7 @@
                (codex-row p)
                (let [row (assoc (pane-row p (screen/read-screen (or (capture h (:pane p) lines) [])) sessions)
                                 :provider :claude
-                                :capabilities #{:read-screen :say :compact :goal})]
+                                :capabilities #{:read-screen :say :compact :goal :answer})]
                  (if (and include-goal? (:goal-active? row) (:session-id row))
                    (assoc row :goal (goal-text (or ((:transcript h) (:cwd row) (:session-id row)) [])))
                    row))))

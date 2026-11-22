@@ -831,6 +831,19 @@
 
 (defonce ^:private registry (atom {}))
 
+(defn record-step!
+  "Append an external STEP to the active job on PANE-ID, without starting or
+   displacing it. Returns the updated job, or nil when the pane has no active
+   job. Used by menu answers, which do not own the pane's job slot."
+  [pane-id step]
+  (when-let [state (some (fn [[_ state]]
+                           (let [job @state]
+                             (when (and (= pane-id (:pane job))
+                                        (#{:queued :running} (:status job)))
+                               state)))
+                         @registry)]
+    (swap! state update :steps conj step)))
+
 (defn- new-job [ref opts]
   {:job-id (str "cc-" (subs (str (random-uuid)) 0 8))
    :ref ref :status :queued :steps [] :opts (dissoc opts :host)

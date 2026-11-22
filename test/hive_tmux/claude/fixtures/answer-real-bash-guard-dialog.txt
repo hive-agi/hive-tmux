@@ -1,0 +1,30 @@
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Locate built-in selection in autonomous
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ cd /home/klein/.claude/jobs/4700ff58/tmp/autonomous-staging && grep -n -E 'defn
+ │ (mcp-handler|for-mode|builtins|server)|builtins|for-mode|:mode' src/autonomous/ring.clj*
+ │ src/autonomous/mcp/server.clj* src/autonomous/mcp/builtins.clj* 2>/dev/null | head -40
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ Hook PreToolUse:Bash requires confirmation for this command:
+ │ The hive guard asks you before this call runs.
+ │
+ │ this call reaches a project outside this session. A session works only in its HCR root (the topmost
+ │ .hive-project.edn above its cwd, through the main checkout for a worktree) and that root's child
+ │ projects. A path under another project's manifest, a project_id or scope naming another project, and
+ │ scope "all" need the operator's yes. A yes to a hive MCP call allows that project for the rest of this
+ │ session; a yes to Bash, Read or any other tool covers that one call only, because the guard never sees
+ │ that answer. Allow it only if the task truly needs that project; to allow the project for good, add its
+ │ id to :match/allow-projects in memory entry 20261015110032-298a2056.
+ │
+ │ … (+7 more lines)
+ settings.json to update hooks
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend
+──────────────────────────────────────────────────────────────────────────────── hive caveman prelude catchup ─
+

@@ -82,7 +82,7 @@
 (deftest a-claude-row-carries-its-capabilities
   (let [row (first (panes/panes (host (atom []) [claude-line])))]
     (is (= :claude (:provider row)))
-    (is (= #{:read-screen :say :compact :goal} (:capabilities row)))))
+    (is (= #{:read-screen :say :compact :goal :answer} (:capabilities row)))))
 
 (deftest panes-captures-the-requested-lines
   (let [calls (atom [])]
