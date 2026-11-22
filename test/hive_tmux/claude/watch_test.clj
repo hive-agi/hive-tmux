@@ -69,7 +69,7 @@
                          :o (assoc opts :exclude ["peer"])))))
 
 (deftest every-event-has-a-sense-class
-  (is (= #{:pane-idle :goal-ended :context-high :pane-waiting :tmux-job} (set (keys sense/event->class))))
+  (is (= #{:pane-idle :goal-ended :context-high :pane-waiting :tmux-job :compact-ready} (set (keys sense/event->class))))
   (testing "a class perceives exactly its own event type"
     (let [specs (sense/class-specs)
           by (into {} (map (juxt :sense/class identity) specs))]

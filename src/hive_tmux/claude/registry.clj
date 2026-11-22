@@ -310,7 +310,13 @@
                 (and transcript (bool (:last_assistant params) true))
                 (assoc :last-assistant (panes/last-assistant-text transcript))))))))
 
-(defn watch-start-cmd [params]
+(declare strict-true?)
+
+(defn watch-start-cmd
+  "`tmux watch start`. auto_compact and takeover enable only on boolean true
+   or the string \"true\" (`strict-true?`): becoming the compactor is a
+   consent, never a guess."
+  [params]
   (let [parent (some-> (or (:parent params) (:agent_id params)) str str/trim not-empty)
         exclude-r (pane-refs (:exclude params))]
     (cond
@@ -323,7 +329,10 @@
       (r/ok (watch/start! (cond-> {:parent parent :host (h-of params)}
                             (:threshold params) (assoc :threshold (int-param (:threshold params) nil))
                             (:interval_ms params) (assoc :interval-ms (int-param (:interval_ms params) nil))
-                            (:exclude params) (assoc :exclude (or (:ok exclude-r) []))))))))
+                            (:exclude params) (assoc :exclude (or (:ok exclude-r) []))
+                            (strict-true? (:auto_compact params)) (assoc :auto-compact? true
+                                                                         :start-job! #(start-job! %1 :compact (dissoc %2 :kind :on-end)))
+                            (strict-true? (:takeover params)) (assoc :takeover? true)))))))
 
 (defn watch-stop-cmd [_] (r/ok (or (watch/stop!) {:running? false})))
 
@@ -394,8 +403,8 @@
               :doc "Answer the Claude Code menu on pane=<%id> (a ref matching two panes is refused). option=<n|label>: printed number or exact label. Only a menu read positively (one ❯ row, consecutive numbers, a selection footer, no composer below) is answered; a checkbox menu is refused. Anything not positively an AskUserQuestion menu is a permission dialog: refused with its question and options to relay via `swarm ask`, answered only with permission=true and expect=<text in the dialog>. \"Don't ask again\" / \"allow all ... this session\" options are always refused, as are your own pane and a call without _caller_id. Sends the arrows, re-reads the pane, sends Enter only when the same menu shows with the highlight on the choice (else :menu-changed with keys sent); after Enter reports delivered? true, confirmed? and any next-menu. Every attempt is appended to ~/.local/state/hive-tmux/answers.edn and to an active pane job's steps; no job is started."
               :params [:pane :option :permission :expect :socket_name]}
    "watch start" {:fn watch-start-cmd
-                  :doc "Watch every Claude pane server-side and shout changes to parent=<agent id> as sixth-sense senses: pane-idle, goal-ended, context-high (threshold, default 400000) and tmux-job (a compact|say|goal job ended). Then `swarm ss wait` instead of polling. interval_ms default 5000; exclude=<refs> (your own pane)."
-                  :params [:parent :threshold :interval_ms :exclude :socket_name]}
+                  :doc "Watch every Claude pane server-side and shout changes to parent=<agent id> as sixth-sense senses: pane-idle, goal-ended, context-high (threshold, default 400000) and tmux-job (a compact|say|goal job ended). Then `swarm ss wait` instead of polling. interval_ms default 5000; exclude=<refs> (your own pane). compact-ready fires when a pane over threshold is idle with an empty prompt and no dialog, and its coordinator shouted WRAPPED or updated a memory tagged handoff + agent-session:coordinator:<id> after the crossing (matched by session id, never pane id). auto_compact=true makes this watcher THE one compactor (host-wide lease ~/.local/state/hive-tmux/compactor.edn; refused while another owner holds it fresh, takeover=true takes it): it silences a wrapped coordinator's own wakers (so its pane can idle) and compacts each compact-ready pane, re-seeding \"hive workflow catchup /caveman, then read hand-off <id> and resume\"."
+                  :params [:parent :threshold :interval_ms :exclude :auto_compact :takeover :socket_name]}
    "watch stop"   {:fn watch-stop-cmd :doc "Stop the pane watcher." :params []}
    "watch status" {:fn watch-status-cmd :doc "The pane watcher: running?, parent, ticks, events fired per kind, last error." :params []}
    "job"     {:fn job-cmd
@@ -465,6 +474,8 @@
    "strip_chrome" {:type "boolean" :description "[tmux read] Drop the status bar, spinner, tip and rules (default true)."}
    "last_assistant" {:type "boolean" :description "[tmux read] Include the newest assistant message from the transcript (default true)."}
    "interval_ms"  {:type "integer" :description "[tmux watch start] Tick interval (default 5000)."}
+   "auto_compact" {:type "boolean" :description "[tmux watch start] Be THE one compactor: silence a WRAPPED coordinator's wakers and compact every compact-ready pane, re-seeding with its hand-off. Takes the host-wide compactor lease; refused while another owner holds it (decision 20261121215259-7b40b779). Only true enables it."}
+   "takeover"     {:type "boolean" :description "[tmux watch start] With auto_compact: take the compactor lease even though another owner renewed it recently (that owner is gone)."}
    "job_id"       {:type "string" :description "[tmux job] Compaction job id from tmux compact."}
    "cancel"       {:type "boolean" :description "[tmux job] With job_id: cancel that job if it has not typed into the pane yet."}
    "interrupt"    {:type "string" :enum ["auto" "true" "false"] :description "[tmux compact] Cut into a working turn that never reaches rest (a /goal pane looping on ss wait). auto (default): only on a pane whose /goal was active when the job began, after interrupt_after_ms without rest, while a read-only wait (ss wait, await, sleep) or no tool runs. true: also without a goal or wait, and for an unclassified tool. false: never. Never while a write runs (git, ship land, kubectl apply ...) or text stands at the prompt."}
