@@ -181,7 +181,9 @@
       (and (= :say kind) (nil? (some-> (:text opts) str str/trim not-empty))) {:reason :no-text}
       (and (= :compact kind) (not (:force? opts)) (not (due? row (:threshold opts))))
       {:reason :under-threshold :ctx-tokens (:ctx-tokens row) :threshold (:threshold opts)}
-      (and (#{:say :goal} kind) (false? (:wait-idle? opts)) (not (idle? row))) {:reason :busy})))
+      (:dialog row) {:reason :dialog :dialog (:dialog row)}
+      ;; A /goal needs no rest (`goal!`), so only a say is refused as busy.
+      (and (= :say kind) (false? (:wait-idle? opts)) (not (idle? row))) {:reason :busy})))
 
 (defn unsent-after
   "The sends JOB planned after its /compact (:sends-planned, [{:step k
@@ -251,6 +253,30 @@
   [h state ref step-key data]
   (fail! state :timeout (merge {:during step-key :last (screen-state (poll/observe h ref))} data)))
 
+(defn goal-command?
+  "Is TEXT a `/goal ...` command? Claude Code takes /goal in at once, even
+   while a turn runs, so it is the one send that needs no rest."
+  [text]
+  (str/starts-with? (str text) "/goal "))
+
+(defn goal-free?
+  "May a /goal be typed into the pane of ROW now? It is a readable Claude
+   prompt (a context count is shown), with no one's text in the composer and
+   no dialog on screen. A working turn does not matter: /goal is accepted
+   while busy (the pane's footer shows `/goal active (3s)` at once)."
+  [row]
+  (boolean (and row (some? (:ctx-tokens row)) (nil? (:input row)) (nil? (:dialog row)))))
+
+(defn- dialog-stop!
+  "Stop the job :skipped :dialog: a menu or permission dialog is on the pane,
+   so nothing is typed, and the dialog is reported instead of waited on
+   (`tmux answer` picks an option). After the compaction it is advisory."
+  [state pane-id row step-key]
+  (stop! state :skipped :dialog
+         {:during step-key :pane pane-id :dialog (:dialog row) :last (screen-state row)
+          :hint (str "A Claude Code menu or permission dialog is open on " pane-id
+                     "; nothing was typed. Answer it (`tmux answer`), then start the job again.")}))
+
 (defn- deliver!
   "Type TEXT once the prompt is free (no one's text there, pane idle); true
    when it was submitted. Text someone left at the prompt is never typed over:
@@ -265,16 +291,24 @@
    a cancel would make, so a job cancelled before it types never types."
   [h state ref pane-id text step-key opts]
   (let [row0 (poll/observe h ref)
-        free? (and (poll/idle? row0) (nil? (:input row0)))
+        goal-cmd? (goal-command? text)
+        free? (if goal-cmd? (goal-free? row0) (and (poll/idle? row0) (nil? (:input row0))))
         wait-ms (if (false? (:wait-idle? opts)) 0 (or (:input-timeout-ms opts) 0))
         on (if (:input row0) {:pending-human-input (:input row0)} {:pane-busy true})
-        row (cond free? row0
+        row (cond (:dialog row0) nil
+                  free? row0
                   (pos? wait-ms) (do (step! state :wait-input (assoc on :during step-key :timeout-ms wait-ms))
                                      (swap! state assoc :waiting-on (assoc on :during step-key))
-                                     (try (poll/wait-input-clear h ref opts wait-ms)
-                                          (finally (swap! state dissoc :waiting-on)))))]
+                                     (try (if goal-cmd?
+                                            (poll/wait-until h ref #(or (goal-free? %) (:dialog %)) opts wait-ms)
+                                            (poll/wait-input-clear h ref opts wait-ms))
+                                          (finally (swap! state dissoc :waiting-on)))))
+        row (when-not (:dialog row) row)]
     (cond
       (cancelled? @state) false
+
+      (and (not row) (:dialog (or (poll/observe h ref) row0)))
+      (do (dialog-stop! state pane-id (or (poll/observe h ref) row0) step-key) false)
 
       (not row)
       (let [end (or (poll/observe h ref) row0)
@@ -317,6 +351,35 @@
             (poll/idle? row) {:idle row}
             :else {:goal-in-force row}))))
 
+(defn- transcript-of
+  "The transcript lines of ROW's session, or nil when they cannot be read."
+  [h row]
+  (when (:session-id row)
+    (guard Exception nil (vec (or ((:transcript h) (:cwd row) (:session-id row)) [])))))
+
+(defn- seconds-age?
+  "Is AGE (the footer's `/goal active (3s)` text) a seconds-only age?"
+  [age]
+  (boolean (some->> age str (re-matches #"\d+s"))))
+
+(defn goal-confirmed?
+  "Is GOAL proven set on ROW after the /goal send? The footer must show a
+   goal active AND it must be the goal just sent: a /goal entry for it in the
+   transcript after the BEFORE-COUNT lines there were at the send, or a footer
+   age back to seconds where BEFORE-ROW showed no seconds-old goal (a busy
+   pane may write the entry only when its turn ends). A footer that was
+   already there proves nothing, and a busy pane is not an acknowledgement."
+  [goal before-row before-count row lines]
+  (boolean
+   (and (:goal-active? row)
+        (or ;; No goal was shown before the send: the footer appearing is
+            ;; this goal (a busy pane may not yet have written its entry).
+            (and before-row (not (:goal-active? before-row)))
+            (and before-count (> (count lines) before-count)
+                 (= goal (panes/goal-text (subvec (vec lines) before-count))))
+            (and (seconds-age? (:goal-age row))
+                 (not (and (:goal-active? before-row) (seconds-age? (:goal-age before-row)))))))))
+
 (defn- send-and-start!
   "Send TEXT as a job's LAST step and end on the pane's acknowledgement: seen
    working, or, for a /goal, the goal shown active, within :start-timeout-ms.
@@ -324,11 +387,15 @@
    {:started? bool :row row}; an unacknowledged delivery is :started? false,
    not a hang. Nil when the delivery stopped it (status is set)."
   [h state ref pane-id text step-key opts]
-  (when (deliver! h state ref pane-id text step-key opts)
-    (let [goal? (str/starts-with? text "/goal ")
-          seen (poll/wait-until h ref #(boolean (or (:busy? %) (and goal? (:goal-active? %))))
-                                opts (:start-timeout-ms opts))]
-      {:started? (boolean seen) :row (or seen (poll/observe h ref))})))
+  (let [goal (when (goal-command? text) (subs text 6))
+        before (when goal (poll/observe h ref))
+        n0 (when goal (some-> (transcript-of h before) count))]
+    (when (deliver! h state ref pane-id text step-key opts)
+      (let [ack (if goal
+                  #(goal-confirmed? goal before n0 % (or (transcript-of h %) []))
+                  #(boolean (:busy? %)))
+            seen (poll/wait-until h ref ack opts (:start-timeout-ms opts))]
+        {:started? (boolean seen) :row (or seen (poll/observe h ref))}))))
 
 (defn- boundaries-of
   "The compact boundaries in the transcript of ROW's session, or nil when it
@@ -506,6 +573,45 @@
     (cond (and base extra) (str base " " extra)
           :else (or base extra))))
 
+(defn- clear-goal!
+  "Type `/goal clear` into the (busy) PANE-ID and wait for its footer to drop
+   the goal, up to :idle-timeout-ms: Claude Code may act on it only when the
+   running tool call returns (review finding 9). True once cleared; nil when
+   it stopped (status is set), after sending the goal back if it was cleared
+   late. The goal captured before is under :cleared-goal."
+  [h state ref pane-id opts]
+  (when (deliver! h state ref pane-id "/goal clear" :goal-clear opts)
+    (swap! state assoc :goal-cleared? true)
+    (or (boolean (poll/wait-until h ref #(and % (not (:goal-active? %))) opts (:idle-timeout-ms opts)))
+        (do (timeout! h state ref :goal-clear {:waited-for :goal-cleared}) nil))))
+
+(defn- goal-cleared-unrestored?
+  "Did JOB type `/goal clear` and end without a confirmed `/goal` restore?"
+  [job]
+  (let [sent (set (keep #(when (:sent %) (:step %)) (:steps job)))]
+    (boolean (and (:goal-cleared? job) (some? (:goal job)) (not (sent :goal-restored))))))
+
+(defn- restore-cleared-goal!
+  "Send back the goal a clear_goal job cleared when the job stopped short of
+   restoring it (a timeout, an unacknowledged re-seed, a busy pane, a cancel),
+   so the pane is never left goalless and its peer does not stop. /goal is
+   accepted while busy; a draft is waited out, a dialog refuses. It runs on a
+   private job map, so a cancel does not block it, and it is recorded under
+   :restore and in the steps, never as the job's outcome."
+  [h state ref opts]
+  (let [goal (:goal @state)
+        probe (atom {:status :running :steps []})
+        sent (guard Throwable {:threw true}
+               (send-and-start! h probe ref (:pane @state) (str "/goal " goal) :goal-restored
+                                (assoc opts :wait-idle? true)))]
+    (swap! state (fn [job]
+                   (-> job
+                       (update :steps into (:steps @probe))
+                       (assoc :restore (cond (:started? sent) {:restored? true :goal goal}
+                                             sent {:restored? :unconfirmed :goal goal}
+                                             :else {:restored? false :goal goal
+                                                    :why (select-keys @probe [:reason :error])})))))))
+
 (defn compact!
   "Compact the pane REF names, through host H, recording progress in STATE
    (an atom). OPTS: see `defaults`, plus :force? (ignore the threshold),
@@ -547,9 +653,24 @@
       (not (or (:force? opts) (due? start (:threshold opts))))
       (swap! state assoc :status :skipped :reason :under-threshold)
 
+      (:dialog start)
+      (dialog-stop! state (:pane start) start :start)
+
       :else
-      (let [pane-id (:pane start)]
-        (when-let [gate (do (step! state :wait-idle {:interrupt (:interrupt opts)})
+      (let [pane-id (:pane start)
+            ;; clear_goal: read the goal while it is still active, then type
+            ;; `/goal clear` into the busy pane so its Stop hook lets the turn
+            ;; end; from there rest is a settled idle as on any pane.
+            pre-captured (when (and (:clear-goal? opts) (:goal-active? start))
+                           (or (some-> (transcript-of h start) panes/goal-text) (:goal opts)))
+            cleared? (when pre-captured
+                       ;; Known before the first key, so a clear that times out
+                       ;; still sends this goal back (`restore-cleared-goal!`).
+                       (swap! state assoc :goal (goal-after opts (when (:restore-goal? opts) pre-captured)))
+                       (clear-goal! h state ref pane-id opts))
+            opts (cond-> opts cleared? (assoc :between-turns? false))]
+        (when-let [gate (when (or (nil? pre-captured) cleared?)
+                          (step! state :wait-idle {:interrupt (:interrupt opts)})
                             (or (if (false? (:interrupt opts))
                                   (some->> (poll/wait-rest h ref poll/idle? opts (:idle-timeout-ms opts))
                                            (hash-map :ready))
@@ -559,8 +680,10 @@
                                                                    (assoc :interrupt-hold (:interrupt-hold @state))))))]
           (let [ready (or (:ready gate) (:row gate))
                 verdict (:interrupt gate)
-                captured (when (and (:restore-goal? opts) (:goal-active? ready) (:session-id ready))
-                           (panes/goal-text (or ((:transcript h) (:cwd ready) (:session-id ready)) [])))
+                captured (if cleared?
+                           (when (:restore-goal? opts) pre-captured)
+                           (when (and (:restore-goal? opts) (:goal-active? ready) (:session-id ready))
+                             (panes/goal-text (or ((:transcript h) (:cwd ready) (:session-id ready)) []))))
                 goal (goal-after opts captured)
                 reseed (when-not (str/blank? (:reseed opts)) (:reseed opts))
                 sends (cond-> [] reseed (conj [reseed :reseed]) goal (conj [(str "/goal " goal) :goal-restored]))
@@ -604,7 +727,14 @@
                 :else
                 (let [last-send (peek sends)
                       settled (when (>= (count sends) 2)
-                                (reseed-and-settle! h state ref pane-id reseed (= goal captured) opts))]
+                                (if cleared?
+                                  ;; The goal was cleared on purpose and /goal is
+                                  ;; accepted while busy: the re-seed only has to
+                                  ;; be acknowledged (seen working), never rested.
+                                  (when-let [r (send-and-start! h state ref pane-id reseed :reseed opts)]
+                                    (swap! state assoc :reseed-acknowledged? (:started? r))
+                                    {:idle (:row r)})
+                                  (reseed-and-settle! h state ref pane-id reseed (= goal captured) opts)))]
                   (cond
                     ;; The goal outlived /compact and keeps the pane working:
                     ;; nothing is left to restore, and nothing is typed into it.
@@ -625,18 +755,29 @@
                     (let [end (poll/observe h ref)]
                       (swap! state assoc :status :done :tokens-after (:ctx-tokens end)
                              :goal-active-after? (:goal-active? end)))))))))))
+    (when (goal-cleared-unrestored? @state)
+      (restore-cleared-goal! h state ref opts))
     @state))
 
 (defn- start-row
   "The pane's first row, waited to a settled idle when WAIT-IDLE? (else it
    must already be idle). Nil when it stopped (status is set)."
-  [h state ref {:keys [wait-idle?] :as opts}]
+  [h state ref {:keys [wait-idle? goal-command?] :as opts}]
   (let [start (poll/observe h ref)
         opts (poll/with-turns opts start)]
     (swap! state assoc :status :running :pane (:pane start) :name (:name start)
            :tokens-before (:ctx-tokens start) :between-turns? (:between-turns? opts))
     (cond
       (nil? start) (fail! state :no-such-pane {:ref ref})
+      ;; A dialog is reported at once, never waited out as if it were work.
+      (:dialog start) (dialog-stop! state (:pane start) start :start)
+      (nil? (:ctx-tokens start))
+      (stop! state :skipped :unreadable-screen
+             {:pane (:pane start) :last (screen-state start)
+              :hint "The pane shows no readable Claude Code prompt and status line; nothing was typed."})
+      ;; A /goal is accepted while a turn runs: no wait for an idle that a
+      ;; goal's Stop hook may never allow (card 20261119233707-70541f83).
+      goal-command? start
       wait-idle? (do (step! state :wait-idle {})
                      (or (poll/wait-rest h ref poll/idle? opts (:idle-timeout-ms opts))
                          (timeout! h state ref :wait-idle {:waited-for (poll/waited-for opts)})))
@@ -664,10 +805,13 @@
 (defn goal!
   "Set the /goal of the pane REF names without compacting it: OPTS :goal
    replaces, :goal-append extends the pane's active goal (read from its
-   transcript). Waits for a settled idle; text at the prompt is waited out up
-   to :input-timeout-ms (`deliver!`), then stops the job."
+   transcript). Claude Code takes /goal in while a turn runs, so the job
+   never waits for an idle (a busy /goal pane may never give one); a dialog
+   or an unreadable screen stops it, and text at the prompt is waited out up
+   to :input-timeout-ms (`deliver!`). :done only once the footer shows THIS
+   goal active (`goal-confirmed?`); else :failed :goal-unconfirmed."
   [h state ref opts]
-  (let [opts (merge defaults {:wait-idle? true} opts)]
+  (let [opts (merge defaults {:wait-idle? true :goal-command? true} opts)]
     (when-let [ready (start-row h state ref opts)]
       (let [captured (when (and (:goal-active? ready) (:session-id ready))
                        (panes/goal-text (or ((:transcript h) (:cwd ready) (:session-id ready)) [])))
@@ -676,8 +820,11 @@
         (if-not goal
           (fail! state :no-goal {:note "pass goal, or goal_append on a pane whose goal is active"})
           (when-let [{:keys [started? row]} (send-and-start! h state ref (:pane ready) (str "/goal " goal) :goal-set opts)]
-            (swap! state assoc :status :done :started? started?
-                   :goal-active-after? (:goal-active? row)))))))
+            (if started?
+              (swap! state assoc :status :done :started? true :goal-active-after? (:goal-active? row))
+              (fail! state :goal-unconfirmed
+                     {:during :goal-set :goal goal :last (screen-state row)
+                      :hint "The /goal was submitted but the footer never showed this goal active."})))))))
   @state)
 
 ;;; Boundary

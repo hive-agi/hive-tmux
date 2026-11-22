@@ -113,7 +113,8 @@
     (bool (:supersede params) false) (assoc :supersede? true)
     (some? (:interrupt params)) (assoc :interrupt (interrupt/mode-param (:interrupt params)))
     (some? (:interrupt_after_ms params)) (assoc :interrupt-after-ms (int-param (:interrupt_after_ms params) nil))
-    (some? (:interrupt_via params)) (assoc :interrupt-via (interrupt/via-param (:interrupt_via params)))))
+    (some? (:interrupt_via params)) (assoc :interrupt-via (interrupt/via-param (:interrupt_via params)))
+    (bool (:clear_goal params) false) (assoc :clear-goal? true)))
 
 (defn- start-job!
   "Every job this subdomain starts reports its end to the pane watcher, which
@@ -333,12 +334,12 @@
               :params [:pane_provider :include_goal :socket_name]}
    "compact" {:fn compact-cmd
               :doc "Wait for rest, capture the /goal, send /compact, re-seed (default \"hive workflow catchup /caveman\"), restore the goal. pane=<ref,...> compacts those panes whatever their size; no pane = every pane over threshold (default 400000) minus exclude. Rest is a settled idle, except on a pane whose /goal is active: a /goal Stop hook restarts the next turn within a poll, so there the job reads the single turn boundary between turns (between_turns=auto, the default; true forces it, false forces the settled idle). Text someone left at a prompt is waited out up to input_timeout_ms (default 600000), never typed over; the job shows it under :waiting-on. A /goal pane that never rests (one turn looping on ss wait) is cut into by interrupt=auto (default) after interrupt_after_ms (default 300000), only while a read-only wait or no tool runs, never mid-write (git, ship land, kubectl apply) or over a draft; interrupt_via=force-send (default) queues /compact and sends it with C-x C-s, escape sends Esc first; interrupt=false waits as before. A stuck job: `tmux cancel job_id=<id>`. Your OWN pane is refused (a sweep leaves it out): compact yourself with `swarm steer self input=/compact then=<reseed> dry_run=false`. Background job; returns job ids."
-              :params [:pane :threshold :reseed :restore_goal :goal :goal_append :instructions :exclude :force :dry_run :input_timeout_ms :between_turns :supersede :interrupt :interrupt_after_ms :interrupt_via :socket_name]}
+              :params [:pane :threshold :reseed :restore_goal :goal :goal_append :instructions :exclude :force :dry_run :input_timeout_ms :between_turns :supersede :interrupt :interrupt_after_ms :interrupt_via :clear_goal :socket_name]}
    "cancel"  {:fn cancel-cmd
               :doc "Cancel a queued or waiting compact|say|goal job (job_id=<id>) that has not typed into its pane yet: it ends :cancelled and frees the pane's slot, so a new job can start there. A job that typed refuses :already-typed, naming the step."
               :params [:job_id]}
    "goal"    {:fn goal-cmd
-              :doc "Arm or replace a pane's /goal WITHOUT compacting: goal=<text> replaces, goal_append=<text> extends the active one. Waits for a settled idle (wait_idle=false: skip a busy pane); text at the prompt is waited out up to input_timeout_ms (not with wait_idle=false), then stops it. Background job; job ends with goal-active-after?."
+              :doc "Arm or replace a pane's /goal WITHOUT compacting: goal=<text> replaces, goal_append=<text> extends the active one. Never waits for idle: Claude Code accepts /goal while a turn runs, so a busy /goal pane is set at once. A menu or permission dialog stops it :skipped :dialog (answer it with `tmux answer`); text at the prompt is waited out up to input_timeout_ms (not with wait_idle=false). Done only once the footer shows this goal active, else failed :goal-unconfirmed. Background job; job ends with goal-active-after?."
               :params [:pane :goal :goal_append :wait_idle :input_timeout_ms :supersede :socket_name]}
    "say"     {:fn say-cmd
               :doc "Submit one prompt (text=) to a pane. Waits for a settled idle unless wait_idle=false; refuses (skipped, pending-human-input) when the prompt line holds text. Job is done once the pane starts on it; read the answer later with `tmux read`."
@@ -401,6 +402,7 @@
    "threshold"    {:type "integer" :description "[tmux compact] Context tokens at or above which a pane is compacted (default 400000)."}
    "reseed"       {:type "string" :description "[tmux compact] Prompt sent after /compact (default \"hive workflow catchup /caveman\"; empty string sends none)."}
    "restore_goal" {:type "boolean" :description "[tmux compact] Re-send the pane's /goal after the re-seed (default true)."}
+   "clear_goal"   {:type "boolean" :description "[tmux compact] On a busy /goal pane, capture the goal and type /goal clear first (accepted while busy), so its Stop hook lets the turn end; then a settled idle, /compact, the re-seed (done once seen working) and the goal back. Any stop after the clear sends the goal back. Default false: interrupt=auto handles a never-resting pane."}
    "instructions" {:type "string" :description "[tmux compact] Text after /compact, as Claude Code's compaction instructions."}
    "exclude"      {:anyOf [{:type "array" :items {:type "string"}} {:type "string"}] :description "[tmux compact|watch start] Pane refs to skip (e.g. your own pane): a JSON array, a comma-separated string or one ref."}
    "force"        {:type "boolean" :description "[tmux compact] Compact even under threshold."}
