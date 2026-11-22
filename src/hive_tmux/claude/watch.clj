@@ -14,6 +14,8 @@
      :pane-waiting  the session status went to :waiting (a permission or other
                     human prompt); once per waiting spell
      :tmux-job      a compact | say | goal job ended (via `job-ended!`)
+     :idle-capacity a coordinator session idle > 10 min, no working ling under
+                    it, open cards on its board (`hive-tmux.claude.idle-capacity`)
 
    The first tick only seeds: a pane already idle when the watch starts is not
    news. Every shout is addressed to :parent, the supervisor's agent id, which
@@ -22,6 +24,7 @@
             [hive-dsl.result :refer [guard]]
             [hive-tmux.claude.compact :as compact]
             [hive-tmux.claude.host :as host]
+            [hive-tmux.claude.idle-capacity :as idle-capacity]
             [hive-tmux.claude.panes :as panes]
             [taoensso.timbre :as log]))
 
@@ -110,17 +113,29 @@
            parent (assoc :parent-id parent))))))
 
 (defn tick!
-  "One pass: read the panes, step, shout every event. Returns the events."
+  "One pass: read the panes, step, shout every event. Returns the events.
+   The idle-capacity sense (`idle-capacity/step`) rides the same pane read,
+   keyed by session id, through the watcher's :idle-ports."
   [w]
-  (let [{:keys [host opts states]} @w
+  (let [{:keys [host opts states ic-states]} @w
         rows (panes/panes host)
-        {next-states :states events :events} (step states rows opts)]
-    (swap! w assoc :states next-states :last-tick (System/currentTimeMillis)
+        {next-states :states events :events} (step states rows opts)
+        ports (:idle-ports opts)
+        now ((or (:now-ms ports) (:now-ms host) #(System/currentTimeMillis)))
+        {ic-next :states ic-events :events}
+        (if ports
+          (idle-capacity/step ports ic-states rows now (select-keys opts [:idle-ms :recheck-ms :exclude]))
+          {:states ic-states :events []})]
+    (swap! w assoc :states next-states :ic-states ic-next :last-tick (System/currentTimeMillis)
            :ticks (inc (:ticks @w 0)))
     (doseq [[event row] events]
       (shout! opts event (assoc (row-data row) :message (message event row)))
       (swap! w update-in [:fired event] (fnil inc 0)))
-    events))
+    (doseq [[event row] ic-events]
+      (shout! opts event (merge (row-data row) (idle-capacity/event-data row)
+                                {:message (idle-capacity/message row)}))
+      (swap! w update-in [:fired event] (fnil inc 0)))
+    (into (vec events) ic-events)))
 
 (defn running? [] (boolean (some-> @watcher deref :running?)))
 
@@ -130,17 +145,21 @@
   (when-let [w @watcher]
     (swap! w assoc :running? false)
     (reset! watcher nil)
-    (dissoc @w :host :states :opts)))
+    (dissoc @w :host :states :ic-states :opts)))
 
 (defn start!
   "Start (or restart) the watcher. OPTS: :parent (agent id the shouts are
    addressed to; required), :threshold, :interval-ms, :exclude (refs),
-   :host and :shout-fn (tests)."
+   :idle-ms / :recheck-ms (idle-capacity), :idle-ports (the idle-capacity
+   ports; default `idle-capacity/default-ports`), :idle-capacity? false
+   (turn that sense off), :host and :shout-fn (tests)."
   [{:keys [parent] :as opts}]
   (when (str/blank? (str parent))
     (throw (ex-info "watch needs parent: the agent id that should hear the senses" {:type :tmux/no-parent})))
   (stop!)
-  (let [opts (merge defaults opts)
+  (let [opts (cond-> (merge defaults opts)
+               (and (not (contains? opts :idle-ports)) (not (false? (:idle-capacity? opts))))
+               (assoc :idle-ports (idle-capacity/default-ports)))
         w (atom {:running? true :opts opts :host (or (:host opts) (host/host))
                  :states {} :started-at (System/currentTimeMillis) :ticks 0 :fired {}})]
     (reset! watcher w)
@@ -151,12 +170,12 @@
                (swap! w assoc :last-error (.getMessage t))
                (log/warn "[claude-watch] tick failed" (.getMessage t))))
         (Thread/sleep (long (:interval-ms opts)))))
-    (-> @w (dissoc :host :states) (update :opts dissoc :host :shout-fn))))
+    (-> @w (dissoc :host :states :ic-states) (update :opts dissoc :host :shout-fn :idle-ports))))
 
 (defn status []
   (if-let [w @watcher]
-    (-> @w (dissoc :host) (update :states count)
-        (update :opts dissoc :host :shout-fn) (assoc :running? true))
+    (-> @w (dissoc :host :ic-states) (update :states count)
+        (update :opts dissoc :host :shout-fn :idle-ports) (assoc :running? true))
     {:running? false}))
 
 (defn job-ended!
