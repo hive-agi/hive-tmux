@@ -27,7 +27,8 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [hive-dsl.result :refer [guard]]
-            [hive-tmux.claude.compact :as compact]))
+            [hive-tmux.claude.compact :as compact]
+            [hive-tmux.claude.poll :as poll]))
 
 ;; Copyright (C) 2026 Pedro Gomes Branquinho (BuddhiLW) <pedrogbranquinho@gmail.com>
 ;;
@@ -78,7 +79,11 @@
   [row threshold crossed-at evidence]
   (cond-> []
     (not (compact/due? row threshold)) (conj :under-threshold)
-    (not (compact/idle? row)) (conj :busy)
+    ;; A pane its /goal Stop hook keeps re-prompting is never idle, yet it is
+    ;; compactable: `compact!` takes its goal-loop path (clear, compact,
+    ;; re-seed with the goal text, set it again). So it reaches compact-ready,
+    ;; and auto-compact, through this same verdict and the one lease.
+    (not (or (compact/idle? row) (poll/goal-looping? row))) (conj :busy)
     (:input row) (conj :human-typing)
     (compact/open-dialog? row) (conj :open-dialog)
     (nil? (:session-id row)) (conj :no-session)

@@ -14,6 +14,18 @@
    30 min at :wait-idle, then 337k -> 469k tokens). `poll/wait-rest` is the one
    waiter, so the choice holds across every step of a job.
 
+   THE GOAL LOOP (card 20261122170735-7c6f5ad3). Measured on Claude Code
+   2.1.330: a pane its /goal Stop hook keeps re-prompting shows NO rest at all
+   (the spinner and its timer run on across turns, `running Stop hooks 1/2`
+   at each turn end, then `Goal not yet met… continuing`), and a /compact
+   typed into it stays Queued through every re-prompt. A force-sent
+   (C-x C-s) /compact does run, but the goal stays active and the loop
+   resumes. So on a pane `poll/goal-looping?` reads, the job reads the goal
+   text, types `/goal clear` (taken in mid-turn, per the /goal docs and as
+   measured), waits for the settled idle the ended loop gives, compacts,
+   re-seeds with the goal text inside the re-seed prompt (`goal-reseed`), and
+   sets the goal again. :goal-loop false turns it off.
+
    Strata:
      Promote   due? / ctx-drop / goal-after          pure
      Pipeline  compact! / say! / goal!               drive the steps through the host port
@@ -69,7 +81,14 @@
    ;; tool is moved to the background, not killed); :escape sends Esc until
    ;; the turn stops, then /compact.
    :interrupt-via :force-send
-   :escape-wait-ms 3000})
+   :escape-wait-ms 3000
+   ;; A pane its /goal Stop hook keeps re-prompting (`poll/goal-looping?`)
+   ;; never rests, and a /compact typed into it stays Queued through every
+   ;; re-prompt (Claude Code 2.1.330, measured). :auto clears the goal there
+   ;; (`/goal clear` is taken in at once, even mid-turn), compacts once the
+   ;; turn ends, re-seeds with the goal text in the prompt and sets the goal
+   ;; again; false leaves such a pane to the other waits.
+   :goal-loop :auto})
 
 ;;; Promote
 
@@ -493,6 +512,11 @@
               v (interrupt/verdict opts {:row row :tool tool :waited-ms (- (now-ms) t0)
                                          :goal-at-start? goal?})]
           (cond
+            ;; Seen re-prompting by its Stop hook: no rest will come, and a
+            ;; forced /compact leaves the goal running (`compact!` clears it).
+            (and (:detect-goal-loop? opts) (poll/goal-looping? row))
+            (do (swap! state dissoc :interrupt-hold) {:goal-loop row})
+
             (:interrupt? v) (do (swap! state dissoc :interrupt-hold) {:interrupt v :row row})
             (>= (now-ms) deadline) nil
             :else (do (when (not= (:hold v) last-hold)
@@ -618,6 +642,48 @@
     (or (boolean (poll/wait-until h ref #(and % (not (:goal-active? %))) opts (:idle-timeout-ms opts)))
         (do (timeout! h state ref :goal-clear {:waited-for :goal-cleared}) nil))))
 
+(defn goal-loop-on?
+  "Does OPTS let a job take the goal-loop path (`:goal-loop`, default :auto)?"
+  [opts]
+  (not (false? (:goal-loop opts))))
+
+(defn goal-reseed
+  "The re-seed RESEED of a job that cleared a looping /goal to compact the
+   pane, carrying the GOAL text, so the session reads what it was working
+   toward even before the /goal is set again (the next send). RESEED alone
+   when there is no goal; nil when there is no re-seed."
+  [reseed goal]
+  (when-not (str/blank? reseed)
+    (if (str/blank? goal)
+      reseed
+      (str reseed " -- then resume your /goal, paused for this compaction and set again right after: " goal))))
+
+(defn- goal-loop-clear!
+  "The goal-loop path (card 20261122170735-7c6f5ad3) on ROW, a pane whose
+   /goal Stop hook keeps re-prompting (`poll/goal-looping?`): read the goal
+   text (transcript, else OPTS :goal), type `/goal clear` (taken in mid-turn;
+   a draft is waited out, `deliver!`), then wait for the settled idle the
+   ended loop now gives. {:ready row :pre-captured goal :cleared? true}, or
+   nil when it stopped (status is set). A goal whose text cannot be read is
+   never cleared: the job stops :skipped :goal-unreadable, nothing typed."
+  [h state ref pane-id row opts]
+  (let [goal (or (some-> (transcript-of h row) panes/goal-text) (some-> (:goal opts) str str/trim not-empty))]
+    (step! state :goal-loop (cond-> {:goal goal}
+                              (:stop-hook-running? row) (assoc :stop-hook-running? true)
+                              (:goal-continuing? row) (assoc :goal-continuing? true)))
+    (swap! state assoc :goal-loop? true)
+    (if-not goal
+      (stop! state :skipped :goal-unreadable
+             {:during :goal-loop :pane pane-id :last (screen-state row)
+              :hint (str "The /goal of " pane-id " loops on its Stop hook, but its text is in no transcript entry, "
+                         "so it was not cleared (it could not be restored). Pass goal=<text> to compact it.")})
+      (do (swap! state assoc :goal (goal-after opts (when (:restore-goal? opts) goal)))
+          (when (clear-goal! h state ref pane-id opts)
+            (step! state :wait-idle {:after :goal-clear})
+            (if-let [r (poll/wait-rest h ref poll/idle? (assoc opts :between-turns? false) (:idle-timeout-ms opts))]
+              {:ready r :pre-captured goal :cleared? true}
+              (timeout! h state ref :wait-idle {:waited-for :settled-idle :after :goal-clear})))))))
+
 (defn- goal-cleared-unrestored?
   "Did JOB type `/goal clear` and end without a confirmed `/goal` restore?"
   [job]
@@ -704,22 +770,41 @@
                        (clear-goal! h state ref pane-id opts))
             opts (cond-> opts cleared? (assoc :between-turns? false))]
         (when-let [gate (when (or (nil? pre-captured) cleared?)
-                          (step! state :wait-idle {:interrupt (:interrupt opts)})
-                            (or (if (false? (:interrupt opts))
-                                  (some->> (poll/wait-rest h ref poll/idle? opts (:idle-timeout-ms opts))
-                                           (hash-map :ready))
-                                  (interrupt-gate h state ref pane-id start opts))
-                                (timeout! h state ref :wait-idle (cond-> {:waited-for (poll/waited-for opts)}
-                                                                   (:interrupt-hold @state)
-                                                                   (assoc :interrupt-hold (:interrupt-hold @state))))))]
-          (let [ready (or (:ready gate) (:row gate))
+                          (let [;; Goal-loop detection runs only on a pane whose /goal is
+                                ;; active at the start and not already cleared: every other
+                                ;; pane takes exactly the waits it took before.
+                                detect? (and (goal-loop-on? opts) (nil? pre-captured) (:goal-active? start))
+                                gate (if (and detect? (poll/goal-looping? start))
+                                       {:goal-loop start}
+                                       (do (step! state :wait-idle {:interrupt (:interrupt opts)})
+                                           (or (if (and (false? (:interrupt opts)) (not detect?))
+                                                 (some->> (poll/wait-rest h ref poll/idle? opts (:idle-timeout-ms opts))
+                                                          (hash-map :ready))
+                                                 (interrupt-gate h state ref pane-id start
+                                                                 (assoc opts :detect-goal-loop? detect?)))
+                                               (timeout! h state ref :wait-idle (cond-> {:waited-for (poll/waited-for opts)}
+                                                                                  (:interrupt-hold @state)
+                                                                                  (assoc :interrupt-hold (:interrupt-hold @state)))))))]
+                            (if-let [row (:goal-loop gate)]
+                              (goal-loop-clear! h state ref pane-id row opts)
+                              gate)))]
+          (let [;; The goal-loop path cleared the goal itself: from here on the
+                ;; job is the clear_goal job, its goal text captured before the clear.
+                pre-captured (or (:pre-captured gate) pre-captured)
+                looped? (boolean (:cleared? gate))
+                cleared? (or looped? cleared?)
+                opts (cond-> opts looped? (assoc :between-turns? false))
+                ready (or (:ready gate) (:row gate))
                 verdict (:interrupt gate)
                 captured (if cleared?
                            (when (:restore-goal? opts) pre-captured)
                            (when (and (:restore-goal? opts) (:goal-active? ready) (:session-id ready))
                              (panes/goal-text (or ((:transcript h) (:cwd ready) (:session-id ready)) []))))
                 goal (goal-after opts captured)
-                reseed (when-not (str/blank? (:reseed opts)) (:reseed opts))
+                reseed (if looped?
+                         ;; The goal text rides in the re-seed too (`goal-reseed`).
+                         (goal-reseed (:reseed opts) goal)
+                         (when-not (str/blank? (:reseed opts)) (:reseed opts)))
                 sends (cond-> [] reseed (conj [reseed :reseed]) goal (conj [(str "/goal " goal) :goal-restored]))
                 text (str "/compact" (some->> (:instructions opts) str/trim not-empty (str " ")))
                 ;; The goal is read while the turn still runs, before any key.
@@ -743,6 +828,16 @@
                 escaped (when (and verdict (= :escape (:interrupt-via opts)))
                           (escape-stop! h state ref pane-id verdict opts))]
             (when-let [{:keys [row]} (cond
+                                       ;; A /compact already QUEUED on the looping pane (an
+                                       ;; earlier job's force-send, or a human's) ran when
+                                       ;; the cleared loop let the turn end (friction
+                                       ;; 220d00ce): the context fell from where the job
+                                       ;; found it. A second /compact is not typed.
+                                       (and looped? (ctx-drop (:ctx-tokens start) ready (:drop-ratio opts)))
+                                       (send-and-compact! h state ref pane-id text (:ctx-tokens start) opts
+                                                          #(do (step! state :compact {:was-queued true :ran-at-goal-clear true})
+                                                               true))
+
                                        (nil? verdict)
                                        (send-and-compact! h state ref pane-id text (:ctx-tokens ready) opts)
 

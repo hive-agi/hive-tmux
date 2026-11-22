@@ -39,6 +39,9 @@
    [:goal-active? :boolean]
    [:goal-ended? {:optional true} :boolean]
    [:goal-age [:maybe :string]]
+   [:goal-status {:optional true} [:maybe [:map [:active? :boolean] [:age [:maybe :string]]]]]
+   [:stop-hook-running? {:optional true} :boolean]
+   [:goal-continuing? {:optional true} :boolean]
    [:footer-name [:maybe :string]]
    [:vim-mode [:maybe [:enum :insert :normal]]]
    [:activity [:maybe :string]]
@@ -93,6 +96,33 @@
       (let [[gap inner] (cut after "(")
             [age closed] (when inner (cut inner ")"))]
         {:age (when (and (str/blank? gap) closed) age)}))))
+
+(def stop-hook-mark
+  "What Claude Code 2.1.330 writes inside the spinner while its Stop hooks run
+   at a turn end (`✶ Pouncing… (running Stop hooks… 1/2 · 40s · ↓ 1.5k
+   tokens)`). Measured on a scratch /goal pane, 2026-11-22: under a /goal the
+   spinner never goes away between turns, its timer keeps counting, and this
+   mark shows for about two seconds at every turn end."
+  "running Stop hooks")
+
+(def goal-continuing-mark
+  "The line the /goal evaluator draws when it judges the goal unmet and starts
+   the next turn (`◯ Goal not yet met… continuing`), 2.1.330."
+  "Goal not yet met")
+
+(defn stop-hook-line?
+  "Does the spinner LINE say Stop hooks are running?"
+  [line]
+  (str/includes? (str line) (str "(" stop-hook-mark)))
+
+(defn goal-continuing-line?
+  "Is LINE the evaluator's `◯ Goal not yet met… continuing`: one glyph, a
+   space, then the mark? Text that merely quotes it does not start that way."
+  [line]
+  (let [t (str/trim (str line))
+        [glyph more] (cut t " ")]
+    (boolean (and more (= 1 (count glyph)) (not (word-char? (first glyph)))
+                  (str/starts-with? more goal-continuing-mark)))))
 
 (defn activity-of
   "The running-turn text of a spinner LINE (`✶ Percolating… (23m 49s · …)`), or
@@ -407,6 +437,11 @@
          :goal-active? (boolean goal)
          :goal-ended? (boolean (and (not goal) (some #(str/includes? % goal-achieved-mark) (subvec lines 0 p))))
          :goal-age (:age goal)
+         :goal-status (when goal {:active? true :age (:age goal)})
+         :stop-hook-running? (boolean (some stop-hook-line? above))
+         ;; The evaluator's line is drawn into the conversation, above the
+         ;; spinner, so it is looked for over the whole screen above the prompt.
+         :goal-continuing? (boolean (and goal (some goal-continuing-line? (subvec lines 0 p))))
          :footer-name (last-some footer-name-of above)
          :vim-mode (vim-mode (subvec lines p))
          :activity activity

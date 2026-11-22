@@ -37,6 +37,18 @@
   [row]
   (idle? row))
 
+(defn goal-looping?
+  "Is ROW a pane its /goal Stop hook keeps re-prompting (card
+   20261122170735-7c6f5ad3)? Its goal is active and the screen shows the loop
+   itself: the spinner says `running Stop hooks`, or the evaluator's `Goal not
+   yet met… continuing` line stands above it. Measured on Claude Code 2.1.330:
+   such a pane shows no idle read at all (the spinner and its timer run on
+   across turns), and a /compact typed into it stays Queued through every
+   re-prompt, so waiting for rest can only time out."
+  [row]
+  (boolean (and row (:goal-active? row) (:busy? row)
+                (or (:stop-hook-running? row) (:goal-continuing? row)))))
+
 (defn observe
   "The row of the pane REF names, read through host H; nil when it cannot be
    read."

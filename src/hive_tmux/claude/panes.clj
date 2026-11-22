@@ -181,6 +181,12 @@
              :suggestion (:suggestion facts)
              :dialog (:dialog facts)
              :tty (not-empty (:tty pane))}
+      ;; The /goal Stop-hook loop (card 20261122170735-7c6f5ad3). Only set
+      ;; when the screen shows it; :goal is the goal TEXT (`panes`
+      ;; :include-goal?), so the footer's goal state is :goal-status.
+      (:goal-status facts) (assoc :goal-status (:goal-status facts))
+      (:stop-hook-running? facts) (assoc :stop-hook-running? true)
+      (:goal-continuing? facts) (assoc :goal-continuing? true)
       ambiguous? (assoc :ambiguous? true)
       (nil? session) (assoc :unjoined? true))))
 
