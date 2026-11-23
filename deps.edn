@@ -27,9 +27,14 @@
         {:mvn/version "0.6.2"}
 
         ;; hive-system: STD-04 Unix-socket adapter (T2 path, 0700/0600,
-        ;; connect-probe before unlink) for the observe listener.
+        ;; connect-probe before unlink) for the observe listener. Only
+        ;; network.path and network.unix are used; they need neither the
+        ;; journal store nor the crypto adapters, so those are excluded.
         io.github.hive-agi/hive-system
-        {:mvn/version "0.4.4"}
+        {:mvn/version "0.4.4"
+         :exclusions [org.replikativ/datahike
+                      caesium/caesium
+                      com.google.crypto.tink/tink]}
         io.github.hive-agi/hive-vessel {:mvn/version "0.2.3"}}
  :aliases
  {

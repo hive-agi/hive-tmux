@@ -110,6 +110,23 @@
           (is (= {:ok :live} (unix/probe path)))))
       (finally (listener/stop! l1)))))
 
+(deftest with-deadline-hands-a-late-value-to-on-late
+  (let [with-deadline #'listener/with-deadline
+        gate (promise)
+        late (promise)]
+    (testing "a value later than the deadline answers ::timeout"
+      (is (= :hive-tmux.observe.listener/timeout
+             (with-deadline 50 (fn [] @gate) #(deliver late %)))))
+    (testing "and the value, once produced, goes to on-late (the late close)"
+      (deliver gate {:ok :bound-late})
+      (is (= {:ok :bound-late} (deref late 3000 ::never))))))
+
+(deftest with-deadline-returns-an-in-time-value-and-never-calls-on-late
+  (let [with-deadline #'listener/with-deadline
+        late (promise)]
+    (is (= {:ok :bound} (with-deadline 3000 (fn [] {:ok :bound}) #(deliver late %))))
+    (is (= ::not-called (deref late 100 ::not-called)))))
+
 (deftest a-non-socket-path-is-left-alone
   (let [path (tmp-socket-path)
         f    (File. path)]

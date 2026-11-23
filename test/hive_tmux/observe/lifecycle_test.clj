@@ -77,6 +77,42 @@
       (is (= 2 (count @ran)))
       (is (every? #(= ["set-hook" "-gu"] (subvec % 0 2)) @ran)))))
 
+(deftest a-second-instance-on-a-live-path-leaves-the-hooks-alone
+  (let [sock  (tmp-sock)
+        ran   (atom [])
+        cfg   {:tmux/observe-socket sock
+               :tmux/observe-install-hooks? true
+               :tmux/observe-hooks ["pane-died"]}
+        live  (lc/start! cfg (fn [_]))]
+    (try
+      (is (some? (:listener live)) "precondition: the first instance is live")
+      (let [h2 (lc/start! cfg #(swap! ran conj %))]
+        (testing "the second start does not bind and installs no hook"
+          (is (nil? (:listener h2)))
+          (is (false? (:hooks-installed? h2)))
+          (is (= [] @ran)))
+        (lc/stop! h2 #(swap! ran conj %))
+        (testing "and its stop! unsets nothing the live instance installed"
+          (is (= [] @ran))))
+      (finally (lc/stop! live (fn [_]))))))
+
+(deftest installed-hooks-carry-the-listener-path-explicitly
+  (testing "a non-default socket path reaches every hook payload as given, never as `-`"
+    (let [sock (tmp-sock)
+          ran  (atom [])
+          h    (lc/start! {:tmux/observe-socket sock
+                           :tmux/observe-install-hooks? true
+                           :tmux/observe-hooks ["pane-died" "client-attached"]}
+                          #(swap! ran conj %))]
+      (try
+        (is (= 2 (count @ran)))
+        (doseq [argv @ran]
+          (is (.contains ^String (last argv) (str " " sock " ")))
+          (is (not (.contains ^String (last argv) " - "))))
+        (finally (lc/stop! h (fn [_]))))))
+  (testing "the default path is resolved to a concrete absolute path before planning"
+    (is (.startsWith ^String (:socket-path (lc/config->observe {})) "/"))))
+
 (deftest client-cmd-resolves-to-something-tmux-can-run
   (testing "a resolved binary is absolute: tmux runs hooks from a cwd we do not own"
     (let [cmd (lc/default-client-cmd)]

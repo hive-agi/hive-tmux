@@ -3,7 +3,8 @@
    UNIX socket.
 
    Contract: `(-main socket-path hook pane)`. SOCKET-PATH `-` means the
-   STD-04 T2 default (see `resolve-socket-path`). Exit 0 on delivery, 2 on a
+   STD-04 T2 default (see `resolve-socket-path`; it assumes /tmp when
+   XDG_RUNTIME_DIR is unset). Exit 0 on delivery, 2 on a
    missing or unresolvable socket path, 1 when the listener is unreachable.
 
    This namespace lives under the `native` classpath root, never `src`: it
@@ -35,7 +36,14 @@
    STD-04 T2 default, computed with the same pure rule the JVM listener's
    default comes from (hive-system.network.path, copied in
    hive-tmux.observe.socket-path): $XDG_RUNTIME_DIR/hive/tmux-observe.sock,
-   else <java.io.tmpdir>/hive-<uid>/tmux-observe.sock.
+   else /tmp/hive-<uid>/tmux-observe.sock.
+
+   With XDG_RUNTIME_DIR unset, `-` ASSUMES /tmp: ClojureWasm's
+   java.io.tmpdir is always /tmp, whereas a JVM listener started with
+   -Djava.io.tmpdir=<dir> binds under <dir>, and `-` then names a different
+   socket. Hooks installed by hive-tmux.observe.lifecycle never use `-`:
+   they pass the listener's resolved path explicitly. Where /proc is absent
+   (macOS) the uid is unknown, so `-` without XDG_RUNTIME_DIR exits 2.
    => {:ok path} or {:error ...}"
   [arg]
   (if (= "-" arg)

@@ -88,12 +88,16 @@
      (try
        (let [observe (config->observe config)
              l (listener/start! (:socket-path observe)
-                                (ingest/dispatch-fn (ingest/default-ports)))]
-         (when (install-hooks? config)
+                                (ingest/dispatch-fn (ingest/default-ports)))
+             ;; Hooks only for a listener that actually bound: when another
+             ;; live instance owns the path, its hooks are its own, and this
+             ;; instance's stop! must not unset them.
+             hooks? (boolean (and l (install-hooks? config)))]
+         (when hooks?
            (doseq [argv (plan/install-plan observe)] (run! argv))
            (log/info "hive-tmux observe: installed tmux hooks"
                      {:hooks (str/join "," (:hooks observe))}))
-         {:listener l :observe observe :hooks-installed? (install-hooks? config)})
+         {:listener l :observe observe :hooks-installed? hooks?})
        (catch Exception e
          (log/warn e "hive-tmux observe: ingestion did not start")
          nil)))))
