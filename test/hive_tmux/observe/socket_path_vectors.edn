@@ -1,0 +1,42 @@
+;; STD-04 T2 socket-path vectors shared by both copies of the rule:
+;; hive-system.network.path (JVM listener, via hive-system 0.4.4) and
+;; hive-tmux.observe.socket-path (cljw hook client). Each vector is
+;; {:in [env tmpdir uid service id] :out <:path string, or the :error keyword>}.
+;; socket_path_test.clj asserts BOTH copies give :out for every :in.
+[{:in [{"XDG_RUNTIME_DIR" "/run/user/1000"} "/tmp" 1000 "tmux-observe" nil]
+  :out "/run/user/1000/hive/tmux-observe.sock"}
+ {:in [{"XDG_RUNTIME_DIR" "/run/user/1000/"} "/tmp" 1000 "tmux-observe" nil]
+  :out "/run/user/1000/hive/tmux-observe.sock"}
+ {:in [{"XDG_RUNTIME_DIR" "/run/user/1000///"} "/tmp" nil "tmux-observe" nil]
+  :out "/run/user/1000/hive/tmux-observe.sock"}
+ {:in [{} "/tmp" 1000 "tmux-observe" nil]
+  :out "/tmp/hive-1000/tmux-observe.sock"}
+ {:in [{"XDG_RUNTIME_DIR" ""} "/tmp/" 1000 "tmux-observe" nil]
+  :out "/tmp/hive-1000/tmux-observe.sock"}
+ {:in [{"XDG_RUNTIME_DIR" "   "} "/var/tmp" 0 "tmux-observe" nil]
+  :out "/var/tmp/hive-0/tmux-observe.sock"}
+ {:in [{} "/tmp" 1000 "tmux-observe" "a1"]
+  :out "/tmp/hive-1000/tmux-observe-a1.sock"}
+ {:in [{} "/tmp" nil "tmux-observe" nil]
+  :out :socket-path/no-uid}
+ {:in [{} "" 1000 "tmux-observe" nil]
+  :out :socket-path/no-base}
+ {:in [{} nil 1000 "tmux-observe" nil]
+  :out :socket-path/no-base}
+ {:in [{} "/tmp" 1000 ".hidden" nil]
+  :out :socket-path/bad-service}
+ {:in [{} "/tmp" 1000 "tmux/observe" nil]
+  :out :socket-path/bad-service}
+ {:in [{} "/tmp" 1000 "tmux-observe" "../x"]
+  :out :socket-path/bad-id}
+ ;; 77-byte base + "/hive/tmux-observe.sock" = exactly 100 bytes: accepted
+ {:in [{"XDG_RUNTIME_DIR" "/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"} "/tmp" 1000 "tmux-observe" nil]
+  :out "/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr/hive/tmux-observe.sock"}
+ ;; one byte more: refused
+ {:in [{"XDG_RUNTIME_DIR" "/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"} "/tmp" 1000 "tmux-observe" nil]
+  :out :socket-path/too-long}
+ ;; bytes, not characters: 38 two-byte chars = 77 bytes base, 100 total: accepted
+ {:in [{"XDG_RUNTIME_DIR" "/éééééééééééééééééééééééééééééééééééééé"} "/tmp" 1000 "tmux-observe" nil]
+  :out "/éééééééééééééééééééééééééééééééééééééé/hive/tmux-observe.sock"}
+ {:in [{"XDG_RUNTIME_DIR" "/ééééééééééééééééééééééééééééééééééééééé"} "/tmp" 1000 "tmux-observe" nil]
+  :out :socket-path/too-long}]

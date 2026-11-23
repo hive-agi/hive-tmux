@@ -7,9 +7,12 @@
    itself is inert (a socket nobody writes to), so it starts by default and the
    operator turns on the half that touches their server."
   (:require [clojure.string :as str]
+            [hive-dsl.result :as r]
+            [hive-system.network.unix :as unix]
             [hive-tmux.observe.hook-plan :as plan]
             [hive-tmux.observe.ingest :as ingest]
             [hive-tmux.observe.listener :as listener]
+            [hive-tmux.observe.socket-path :as socket-path]
             [taoensso.timbre :as log]))
 
 (defn default-client-cmd
@@ -34,13 +37,20 @@
         ["cljw" "-cp" "src:native" "-m" "hive-tmux.observe.hook-client"])))
 
 (defn default-socket-path
-  "Where the listener binds when the operator names no path.
+  "Where the listener binds when the operator names no path: the STD-04 T2
+   path of service `tmux-observe`, computed by hive-system's adapter
+   ($XDG_RUNTIME_DIR/hive/tmux-observe.sock, else
+   <java.io.tmpdir>/hive-<uid>/tmux-observe.sock, at most 100 bytes). The
+   hook client computes the same path through hive-tmux.observe.socket-path.
 
-   Prefers `$XDG_RUNTIME_DIR`, which is per-user and cleared on logout, so a
-   stale socket cannot outlive the session that made it. The path must stay
-   under the OS 108-byte `sun_path` cap, which a runtime dir comfortably does."
+   Throws when the rule refuses (an over-long path, no base directory):
+   `start!` turns that into a logged, not-started listener."
   []
-  (str (or (System/getenv "XDG_RUNTIME_DIR") "/tmp") "/hive-tmux-observe.sock"))
+  (let [res (unix/default-socket-path socket-path/service)]
+    (if (r/ok? res)
+      (:path (:ok res))
+      (throw (ex-info (str "hive-tmux observe: no T2 socket path: " (:message res))
+                      res)))))
 
 (defn config->observe
   "The ingestion config carried by addon CONFIG, with defaults applied."

@@ -8,6 +8,14 @@
 ;;
 ;; SPDX-License-Identifier: MIT
 
+(defn- tmp-sock
+  "A socket path in a fresh directory this process owns (the adapter
+   refuses a socket directory owned by another user, e.g. /tmp itself)."
+  []
+  (str (java.nio.file.Files/createTempDirectory
+        "hive-obs-lc-" (make-array java.nio.file.attribute.FileAttribute 0))
+       "/tmux-observe.sock"))
+
 (deftest hook-installation-is-off-by-default
   (testing "set-hook -g is a persistent change to a server hive does not own"
     (is (false? (lc/install-hooks? {})))
@@ -19,10 +27,14 @@
   (is (false? (lc/enabled? {:tmux/observe? false}))))
 
 (deftest defaults-and-overrides
-  (testing "the default socket lives under the per-user runtime dir"
-    (let [p (lc/default-socket-path)]
-      (is (.endsWith p "hive-tmux-observe.sock"))
-      (is (< (count p) 100) "must stay under the OS sun_path cap")))
+  (testing "the default socket is the STD-04 T2 path of service tmux-observe"
+    (let [p   (lc/default-socket-path)
+          xdg (System/getenv "XDG_RUNTIME_DIR")]
+      (is (.endsWith p "/tmux-observe.sock"))
+      (if (seq xdg)
+        (is (.startsWith p (str xdg "/hive/")))
+        (is (re-find #"/hive-\d+/tmux-observe\.sock$" p)))
+      (is (<= (alength (.getBytes p "UTF-8")) 100) "must stay under the OS sun_path cap")))
   (testing "operator config wins over every default"
     (let [c (lc/config->observe {:tmux/observe-socket "/run/x.sock"
                                  :tmux/observe-hooks ["pane-died"]
@@ -38,7 +50,7 @@
 
 (deftest start-without-opt-in-never-touches-tmux
   (let [ran (atom [])
-        sock (str (System/getProperty "java.io.tmpdir") "/hive-obs-lc-" (System/nanoTime) ".sock")
+        sock (tmp-sock)
         h (lc/start! {:tmux/observe-socket sock} #(swap! ran conj %))]
     (try
       (testing "the listener is up but no tmux invocation was made"
@@ -51,7 +63,7 @@
 
 (deftest opt-in-installs-and-removes-exactly-its-own-hooks
   (let [ran (atom [])
-        sock (str (System/getProperty "java.io.tmpdir") "/hive-obs-lc-" (System/nanoTime) ".sock")
+        sock (tmp-sock)
         cfg {:tmux/observe-socket sock
              :tmux/observe-install-hooks? true
              :tmux/observe-hooks ["pane-died" "client-attached"]}
