@@ -71,6 +71,41 @@ selection containing Codex starts no jobs.
 These inspection commands use the tmux CLI and work independently of the
 Python bridge used to create managed terminal vessels.
 
+## tmux event ingestion (observe socket)
+
+The addon listens on a Unix socket for events sent by tmux hooks. The
+default path follows the hive socket standard (STD-04 T2):
+
+- `$XDG_RUNTIME_DIR/hive/tmux-observe.sock` when `XDG_RUNTIME_DIR` is set,
+- else `<java.io.tmpdir>/hive-<uid>/tmux-observe.sock`.
+
+The directory is created 0700 and the socket is 0600. If a live listener
+already answers on the path, a second instance does not start and does not
+touch tmux hooks. `:tmux/observe-socket` sets an explicit path.
+
+Hooks are installed only with `:tmux/observe-install-hooks? true`. An
+installed hook always carries the listener's resolved path. The hook
+client (`hive-tmux-hook <socket> <hook> <pane>`) also accepts `-` as the
+socket, meaning the default path above. With `XDG_RUNTIME_DIR` unset, `-`
+assumes `/tmp`, so it does not match a JVM started with
+`-Djava.io.tmpdir=<dir>`. Pass the explicit path in that case.
+
+### Upgrading from a release before the STD-04 socket path
+
+The old default was `$XDG_RUNTIME_DIR/hive-tmux-observe.sock` (or
+`/tmp/hive-tmux-observe.sock`). Hooks installed by an older release keep
+that path in their `run-shell` command. After the upgrade the hook client
+exits 1 on every firing and the events are lost with no log line in hive.
+Reinstall the hooks once after upgrading:
+
+- with `:tmux/observe-install-hooks? true`: restart the addon (or hive-mcp);
+  its start reinstalls every hook with the new path;
+- with hooks you installed by hand: rerun your `set-hook -g` commands with
+  the new path, or set `:tmux/observe-socket` to the old path.
+
+Check with `tmux show-hooks -g`: every hive-tmux hook must name the new
+socket path.
+
 ## Development
 
 ```bash
