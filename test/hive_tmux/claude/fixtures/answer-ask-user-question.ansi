@@ -1,0 +1,7 @@
+  Which work should the pane do next?
+  1. Pause for compaction
+     Compact the context, then resume the queued work.
+❯ 2. Continue with the current task
+     Keep the current context and finish the card.
+  3. Stop and explain
+  Enter to select · ↑/↓ to navigate · Esc to cancel

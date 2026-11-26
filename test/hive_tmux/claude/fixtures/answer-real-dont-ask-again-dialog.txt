@@ -1,0 +1,26 @@
+ │ Code intelligence: clojure (check/repair/format/eval/wrap), analysis (lsp-mcp). CIDER/REPL operations
+ │ come from the hive.emacs addon. Addons extend dynamically. Use command='help' to list all.…
+ (ctrl+o to expand description)
+
+ │ Hook PreToolUse:mcp__hive__code requires confirmation for this tool:
+ │ The hive guard asks you before this call runs.
+ │
+ │ this call reaches a project outside this session. A session works only in its HCR root (the topmost
+ │ .hive-project.edn above its cwd, through the main checkout for a worktree) and that root's child
+ │ projects. A path under another project's manifest, a project_id or scope naming another project, and
+ │ scope "all" need the operator's yes. A yes to a hive MCP call allows that project for the rest of this
+ │ session; a yes to Bash, Read or any other tool covers that one call only, because the guard never sees
+ │ that answer. Allow it only if the task truly needs that project; to allow the project for good, add its
+ │ id to :match/allow-projects in memory entry 20261015110032-298a2056.
+ │
+ │ … (+7 more lines)
+ settings.json to update hooks
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for hive — Code commands in /home/klein/PP/funeraria
+   3. No
+ ↑ 8 more lines 
+ Esc to cancel · Tab to amend
+──────────────────────────────────────────────────────────────────────────────── hive caveman prelude catchup ─
+

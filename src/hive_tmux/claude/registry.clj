@@ -19,7 +19,9 @@
             [hive-tmux.claude.screen :as screen]
             [hive-tmux.claude.sense :as sense]
             [hive-tmux.claude.interrupt :as interrupt]
-            [clojure.edn :as edn]))
+            [hive-tmux.claude.answer :as answer]
+            [clojure.edn :as edn]
+            [hive-tmux.claude.caller :as caller]))
 
 ;; Copyright (C) 2026 Pedro Gomes Branquinho (BuddhiLW) <pedrogbranquinho@gmail.com>
 ;;
@@ -113,7 +115,9 @@
     (bool (:supersede params) false) (assoc :supersede? true)
     (some? (:interrupt params)) (assoc :interrupt (interrupt/mode-param (:interrupt params)))
     (some? (:interrupt_after_ms params)) (assoc :interrupt-after-ms (int-param (:interrupt_after_ms params) nil))
-    (some? (:interrupt_via params)) (assoc :interrupt-via (interrupt/via-param (:interrupt_via params)))))
+    (some? (:interrupt_via params)) (assoc :interrupt-via (interrupt/via-param (:interrupt_via params)))
+    (bool (:clear_goal params) false) (assoc :clear-goal? true)
+    (some? (:goal_loop params)) (assoc :goal-loop (bool (:goal_loop params) true))))
 
 (defn- start-job!
   "Every job this subdomain starts reports its end to the pane watcher, which
@@ -136,9 +140,17 @@
           (let [pid (parse-long digits)] (when (pos? pid) pid)))))))
 
 (defn own-pane?
-  "Does ROW show the session of the caller whose pid is PID?"
-  [row pid]
-  (boolean (and pid (number? (:pid row)) (= pid (long (:pid row))))))
+  "Does ROW show the caller's session? TOKEN is a `caller/caller-token`
+   ({:pid n} or {:session-token s}) or a bare pid (`caller-pid`)."
+  [row token]
+  (caller/own-pane? row token))
+
+(defn- caller-refusal
+  "The fail-closed refusal of COMMAND for a caller id that names nothing
+   (`caller/identity-of` :unresolvable), or nil."
+  [ident command]
+  (when-let [id (:unresolvable ident)]
+    (r/err :tmux/unresolvable-caller (caller/unresolvable-error id command))))
 
 (def self-compact
   "Where the caller compacts its own pane instead."
@@ -161,10 +173,14 @@
    would cancel queued jobs on every due pane."
   [params]
   (let [exclude-r (pane-refs (:exclude params))
-        refs-r (pane-refs (:pane params))]
+        refs-r (pane-refs (:pane params))
+        ident (caller/identity-of (:_caller_id params))]
     (cond
       (r/err? exclude-r) (assoc exclude-r :param :exclude)
       (r/err? refs-r) (assoc refs-r :param :pane)
+      ;; Fail closed: a coordinator id that names nothing cannot be told
+      ;; apart from the owner of any pane (card 20261122175413-3d66aa77).
+      (:unresolvable ident) (caller-refusal ident :compact)
 
       (and (bool (:supersede params) false) (nil? (:ok refs-r)))
       (r/err :tmux/supersede-needs-pane
@@ -178,7 +194,7 @@
             exclude (set (:ok exclude-r))
             rows (panes/panes h {:provider :all})
             refs (:ok refs-r)
-            me (caller-pid (:_caller_id params))
+            me (:token ident)
             matched (if refs
                       (keep (fn [ref] (some #(when (some #{ref} (refs-of %)) %) rows)) refs)
                       (filter #(and (= :claude (:provider %))
@@ -308,7 +324,13 @@
                 (and transcript (bool (:last_assistant params) true))
                 (assoc :last-assistant (panes/last-assistant-text transcript))))))))
 
-(defn watch-start-cmd [params]
+(declare strict-true?)
+
+(defn watch-start-cmd
+  "`tmux watch start`. auto_compact and takeover enable only on boolean true
+   or the string \"true\" (`strict-true?`): becoming the compactor is a
+   consent, never a guess."
+  [params]
   (let [parent (some-> (or (:parent params) (:agent_id params)) str str/trim not-empty)
         exclude-r (pane-refs (:exclude params))]
     (cond
@@ -321,11 +343,59 @@
       (r/ok (watch/start! (cond-> {:parent parent :host (h-of params)}
                             (:threshold params) (assoc :threshold (int-param (:threshold params) nil))
                             (:interval_ms params) (assoc :interval-ms (int-param (:interval_ms params) nil))
-                            (:exclude params) (assoc :exclude (or (:ok exclude-r) []))))))))
+                            (:exclude params) (assoc :exclude (or (:ok exclude-r) []))
+                            (strict-true? (:auto_compact params)) (assoc :auto-compact? true
+                                                                         :start-job! #(start-job! %1 :compact (dissoc %2 :kind :on-end)))
+                            (strict-true? (:takeover params)) (assoc :takeover? true)))))))
 
 (defn watch-stop-cmd [_] (r/ok (or (watch/stop!) {:running? false})))
 
 (defn watch-status-cmd [_] (r/ok (watch/status)))
+
+(defn- strict-true?
+  "Only boolean true or the string \"true\" (any case, trimmed) enables a
+   consent flag; \"off\", \"\", \"yes\" and everything else are false."
+  [x]
+  (or (true? x) (and (string? x) (= "true" (str/lower-case (str/trim x))))))
+
+(defn answer-cmd
+  "Pick an option in the menu a Claude pane is already showing. An immediate
+   input operation, not a background job; a queued or running job on the pane
+   is kept and the answer noted in its steps. The caller must be identified
+   (`_caller_id`), must not be the pane's own session, and must name exactly
+   one pane. Permission dialogs and standing grants are gated in
+   `answer/answer!`."
+  [params]
+  (let [h (h-of params)
+        ref (some-> (:pane params) str str/trim not-empty)
+        option (some-> (:option params) str str/trim not-empty)
+        caller (some-> (:_caller_id params) str str/trim not-empty)
+        rows (when ref (filterv #(some #{ref} (refs-of %)) (panes/panes h {:provider :all})))
+        row (first rows)]
+    (cond
+      (nil? ref) (r/err :tmux/no-pane {:hint pane-hint})
+      (nil? option) (r/err :tmux/no-option {:hint "option=<number|label>"})
+      (nil? caller) (r/err :tmux/no-caller {:hint "answer needs an identified caller (_caller_id)"})
+      (empty? rows) (r/err :tmux/no-such-pane {:pane ref})
+      (< 1 (count rows))
+      (r/err :tmux/ambiguous-pane {:pane ref :matches (mapv #(select-keys % [:pane :target :name]) rows)
+                                   :hint "name the pane by its %id"})
+      (:unresolvable (caller/identity-of caller))
+      (caller-refusal (caller/identity-of caller) :answer)
+
+      (own-pane? row (:token (caller/identity-of caller)))
+      (r/err :tmux/own-pane {:pane (:pane row) :name (:name row)
+                             :why "a session never answers its own menu or permission dialog"})
+      (not (contains? (:capabilities row) :answer))
+      (r/err :tmux/unsupported-provider {:pane ref :provider (:provider row) :command :answer
+                                        :capabilities (:capabilities row)})
+      :else (let [{:keys [error] :as result}
+                  (answer/answer! h row option
+                                  (cond-> {:actor caller
+                                           :permission? (strict-true? (:permission params))}
+                                    (some? (:expect params)) (assoc :expect (str (:expect params)))))
+                  error (when error (if (namespace error) error (keyword "tmux" (name error))))]
+              (if error (r/err error (dissoc result :error)) (r/ok result))))))
 
 (def subcommands
   {"panes"   {:fn panes-cmd
@@ -333,22 +403,25 @@
               :params [:pane_provider :include_goal :socket_name]}
    "compact" {:fn compact-cmd
               :doc "Wait for rest, capture the /goal, send /compact, re-seed (default \"hive workflow catchup /caveman\"), restore the goal. pane=<ref,...> compacts those panes whatever their size; no pane = every pane over threshold (default 400000) minus exclude. Rest is a settled idle, except on a pane whose /goal is active: a /goal Stop hook restarts the next turn within a poll, so there the job reads the single turn boundary between turns (between_turns=auto, the default; true forces it, false forces the settled idle). Text someone left at a prompt is waited out up to input_timeout_ms (default 600000), never typed over; the job shows it under :waiting-on. A /goal pane that never rests (one turn looping on ss wait) is cut into by interrupt=auto (default) after interrupt_after_ms (default 300000), only while a read-only wait or no tool runs, never mid-write (git, ship land, kubectl apply) or over a draft; interrupt_via=force-send (default) queues /compact and sends it with C-x C-s, escape sends Esc first; interrupt=false waits as before. A stuck job: `tmux cancel job_id=<id>`. Your OWN pane is refused (a sweep leaves it out): compact yourself with `swarm steer self input=/compact then=<reseed> dry_run=false`. Background job; returns job ids."
-              :params [:pane :threshold :reseed :restore_goal :goal :goal_append :instructions :exclude :force :dry_run :input_timeout_ms :between_turns :supersede :interrupt :interrupt_after_ms :interrupt_via :socket_name]}
+              :params [:pane :threshold :reseed :restore_goal :goal :goal_append :instructions :exclude :force :dry_run :input_timeout_ms :between_turns :supersede :interrupt :interrupt_after_ms :interrupt_via :clear_goal :goal_loop :socket_name]}
    "cancel"  {:fn cancel-cmd
               :doc "Cancel a queued or waiting compact|say|goal job (job_id=<id>) that has not typed into its pane yet: it ends :cancelled and frees the pane's slot, so a new job can start there. A job that typed refuses :already-typed, naming the step."
               :params [:job_id]}
    "goal"    {:fn goal-cmd
-              :doc "Arm or replace a pane's /goal WITHOUT compacting: goal=<text> replaces, goal_append=<text> extends the active one. Waits for a settled idle (wait_idle=false: skip a busy pane); text at the prompt is waited out up to input_timeout_ms (not with wait_idle=false), then stops it. Background job; job ends with goal-active-after?."
+              :doc "Arm or replace a pane's /goal WITHOUT compacting: goal=<text> replaces, goal_append=<text> extends the active one. Never waits for idle: Claude Code accepts /goal while a turn runs, so a busy /goal pane is set at once. A menu or permission dialog stops it :skipped :dialog (answer it with `tmux answer`); text at the prompt is waited out up to input_timeout_ms (not with wait_idle=false). Done only once the footer shows this goal active, else failed :goal-unconfirmed. Background job; job ends with goal-active-after?."
               :params [:pane :goal :goal_append :wait_idle :input_timeout_ms :supersede :socket_name]}
    "say"     {:fn say-cmd
-              :doc "Submit one prompt (text=) to a pane. Waits for a settled idle unless wait_idle=false; refuses (skipped, pending-human-input) when the prompt line holds text. Job is done once the pane starts on it; read the answer later with `tmux read`."
+              :doc "Submit one prompt (text=) to a pane. Waits for a settled idle unless wait_idle=false; refuses (skipped, reason human-typing) when the prompt line holds text, and (skipped, reason open-dialog) while a menu or permission dialog is open or the session is :waiting; nothing lifts either. Job is done once the pane starts on it; read the answer later with `tmux read`."
               :params [:pane :text :wait_idle :supersede :socket_name]}
    "read"    {:fn read-cmd
               :doc "Read a Claude or Codex pane's last N screen lines (lines, default 40). Claude may include transcript last_assistant and strip_chrome (both default true). Codex returns terminal text without Claude parsing, transcript attribution or inferred busy/input state."
               :params [:pane :lines :strip_chrome :last_assistant :socket_name]}
+   "answer"  {:fn answer-cmd
+              :doc "Answer the Claude Code menu on pane=<%id> (a ref matching two panes is refused). option=<n|label>: printed number or exact label. Only a menu read positively (one ❯ row, consecutive numbers, a selection footer, no composer below) is answered; a checkbox menu is refused. Anything not positively an AskUserQuestion menu is a permission dialog: refused with its question and options to relay via `swarm ask`, answered only with permission=true and expect=<text in the dialog>. \"Don't ask again\" / \"allow all ... this session\" options are always refused, as are your own pane and a call without _caller_id. Sends the arrows, re-reads the pane, sends Enter only when the same menu shows with the highlight on the choice (else :menu-changed with keys sent); after Enter reports delivered? true, confirmed? and any next-menu. Every attempt is appended to ~/.local/state/hive-tmux/answers.edn and to an active pane job's steps; no job is started."
+              :params [:pane :option :permission :expect :socket_name]}
    "watch start" {:fn watch-start-cmd
-                  :doc "Watch every Claude pane server-side and shout changes to parent=<agent id> as sixth-sense senses: pane-idle, goal-ended, context-high (threshold, default 400000) and tmux-job (a compact|say|goal job ended). Then `swarm ss wait` instead of polling. interval_ms default 5000; exclude=<refs> (your own pane)."
-                  :params [:parent :threshold :interval_ms :exclude :socket_name]}
+                  :doc "Watch every Claude pane server-side and shout changes to parent=<agent id> as sixth-sense senses: pane-idle, goal-ended, context-high (threshold, default 400000) and tmux-job (a compact|say|goal job ended). Then `swarm ss wait` instead of polling. interval_ms default 5000; exclude=<refs> (your own pane). compact-ready fires when a pane over threshold is idle with an empty prompt and no dialog, and its coordinator shouted WRAPPED or updated a memory tagged handoff + agent-session:coordinator:<id> after the crossing (matched by session id, never pane id). auto_compact=true makes this watcher THE one compactor (host-wide lease ~/.local/state/hive-tmux/compactor.edn; refused while another owner holds it fresh, takeover=true takes it): it silences a wrapped coordinator's own wakers (so its pane can idle) and compacts each compact-ready pane, re-seeding \"hive workflow catchup /caveman, then read hand-off <id> and resume\"."
+                  :params [:parent :threshold :interval_ms :exclude :auto_compact :takeover :socket_name]}
    "watch stop"   {:fn watch-stop-cmd :doc "Stop the pane watcher." :params []}
    "watch status" {:fn watch-status-cmd :doc "The pane watcher: running?, parent, ticks, events fired per kind, last error." :params []}
    "job"     {:fn job-cmd
@@ -401,11 +474,12 @@
    "threshold"    {:type "integer" :description "[tmux compact] Context tokens at or above which a pane is compacted (default 400000)."}
    "reseed"       {:type "string" :description "[tmux compact] Prompt sent after /compact (default \"hive workflow catchup /caveman\"; empty string sends none)."}
    "restore_goal" {:type "boolean" :description "[tmux compact] Re-send the pane's /goal after the re-seed (default true)."}
+   "clear_goal"   {:type "boolean" :description "[tmux compact] On a busy /goal pane, capture the goal and type /goal clear first (accepted while busy), so its Stop hook lets the turn end; then a settled idle, /compact, the re-seed (done once seen working) and the goal back. Any stop after the clear sends the goal back. Default false: interrupt=auto handles a never-resting pane."}
    "instructions" {:type "string" :description "[tmux compact] Text after /compact, as Claude Code's compaction instructions."}
    "exclude"      {:anyOf [{:type "array" :items {:type "string"}} {:type "string"}] :description "[tmux compact|watch start] Pane refs to skip (e.g. your own pane): a JSON array, a comma-separated string or one ref."}
    "force"        {:type "boolean" :description "[tmux compact] Compact even under threshold."}
    "dry_run"      {:type "boolean" :description "[tmux compact] List what would be compacted; start nothing."}
-   "input_timeout_ms" {:type "integer" :description "[tmux compact|goal] How long text someone left at the prompt is waited out before the job skips as pending-human-input (default 600000; 0 skips at once)."}
+   "input_timeout_ms" {:type "integer" :description "[tmux compact|goal] How long text someone left at the prompt is waited out before the job skips as human-typing (default 600000; 0 skips at once). force=true never lifts it."}
    "between_turns" {:type "string" :description "[tmux compact] How rest is proven: auto (default) reads a /goal-active pane at its single turn boundary and every other pane at a settled idle; true forces the turn boundary, false forces the settled idle."}
    "include_goal" {:type "boolean" :description "[tmux panes] Also read each goal-active pane's /goal text."}
    "socket_name"  {:type "string" :description "[tmux panes|compact] tmux -L socket; default server when omitted."}
@@ -417,12 +491,18 @@
    "strip_chrome" {:type "boolean" :description "[tmux read] Drop the status bar, spinner, tip and rules (default true)."}
    "last_assistant" {:type "boolean" :description "[tmux read] Include the newest assistant message from the transcript (default true)."}
    "interval_ms"  {:type "integer" :description "[tmux watch start] Tick interval (default 5000)."}
+   "auto_compact" {:type "boolean" :description "[tmux watch start] Be THE one compactor: silence a WRAPPED coordinator's wakers and compact every compact-ready pane, re-seeding with its hand-off. Takes the host-wide compactor lease; refused while another owner holds it (decision 20261121215259-7b40b779). Only true enables it."}
+   "takeover"     {:type "boolean" :description "[tmux watch start] With auto_compact: take the compactor lease even though another owner renewed it recently (that owner is gone)."}
+   "goal_loop"    {:type "boolean" :description "[tmux compact] A pane its /goal Stop hook keeps re-prompting (footer `/goal active`, spinner `running Stop hooks` or `Goal not yet met… continuing`) never rests and keeps a typed /compact Queued. true (default): clear the goal (`/goal clear`, taken in mid-turn; a draft is waited out), compact once the turn ends, re-seed with the goal text in the prompt, then set the goal again. false: leave such a pane to the other waits."}
    "job_id"       {:type "string" :description "[tmux job] Compaction job id from tmux compact."}
    "cancel"       {:type "boolean" :description "[tmux job] With job_id: cancel that job if it has not typed into the pane yet."}
    "interrupt"    {:type "string" :enum ["auto" "true" "false"] :description "[tmux compact] Cut into a working turn that never reaches rest (a /goal pane looping on ss wait). auto (default): only on a pane whose /goal was active when the job began, after interrupt_after_ms without rest, while a read-only wait (ss wait, await, sleep) or no tool runs. true: also without a goal or wait, and for an unclassified tool. false: never. Never while a write runs (git, ship land, kubectl apply ...) or text stands at the prompt."}
    "interrupt_after_ms" {:type "integer" :description "[tmux compact] How long interrupt=auto waits for rest before it may cut in (default 300000)."}
    "interrupt_via" {:type "string" :enum ["force-send" "escape"] :description "[tmux compact] force-send (default): type /compact, which Claude Code queues, then C-x C-s to send it now; the running tool moves to the background, not killed. escape: Esc until the turn stops (kills the tool call), then /compact."}
-   "supersede"    {:type "boolean" :description "[tmux compact|say|goal] Cancel the pane's queued job if it has not typed yet and take its slot (default false: refuse :already-running naming it)."}})
+   "supersede"    {:type "boolean" :description "[tmux compact|say|goal] Cancel the pane's queued job if it has not typed yet and take its slot (default false: refuse :already-running naming it)."}
+   "option"       {:type "string" :description "[tmux answer] Printed option number (1-based) or exact option label in the current Claude Code menu."}
+   "permission"   {:type "boolean" :description "[tmux answer] Answer a dialog that is not positively an AskUserQuestion menu (a permission dialog). Only after the operator said yes through `swarm ask`; needs expect."}
+   "expect"       {:type "string" :description "[tmux answer] Text from the question or dialog body you read; the answer is refused unless the live menu still shows it. Required with permission=true."}})
 
 
 (def addon-key

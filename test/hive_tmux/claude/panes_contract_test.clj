@@ -82,7 +82,7 @@
 (deftest a-claude-row-carries-its-capabilities
   (let [row (first (panes/panes (host (atom []) [claude-line])))]
     (is (= :claude (:provider row)))
-    (is (= #{:read-screen :say :compact :goal} (:capabilities row)))))
+    (is (= #{:read-screen :say :compact :goal :answer} (:capabilities row)))))
 
 (deftest panes-captures-the-requested-lines
   (let [calls (atom [])]
@@ -124,7 +124,7 @@
     (is (= {:pane "%1" :target "s:0.1" :name "alpha" :cwd "/w2" :session-id "sid" :job-id "job"
             :pid 42 :kind "bg" :status :busy :ctx-tokens 1200 :busy? true :goal-active? true
             :goal-ended? false :goal-age "2m" :activity "Thinking" :vim-mode "INSERT" :input "hi"
-            :suggestion "s" :tty "/dev/pts/1"}
+            :suggestion "s" :dialog nil :tty "/dev/pts/1"}
            (panes/pane-row pane facts [session])))
     (testing "unjoined: the first name stays, the pane's cwd is used, an empty tty is nil"
       (let [row (panes/pane-row (assoc pane :tty "") facts [])]

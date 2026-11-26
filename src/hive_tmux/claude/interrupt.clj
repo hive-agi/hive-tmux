@@ -8,7 +8,8 @@
    but a keystroke into a working turn can cut a commit, a `ship land` or a
    `kubectl apply` in half. So the rule is narrow:
 
-     * never while text stands at the prompt (someone's draft);
+     * never while text stands at the prompt (someone's draft), nor while a
+       dialog is open (on screen, or the session :waiting on a human);
      * never while the running tool reads as a WRITE (`write-markers`);
      * under :auto, only on a pane whose /goal was active when the job began,
        after it waited :interrupt-after-ms for rest, and only while the
@@ -139,6 +140,7 @@
       (nil? row) {:hold :unreadable}
       (not (:busy? row)) {:hold :not-busy}
       (:input row) {:hold :prompt-holds-text :input (:input row)}
+      (or (:dialog row) (= :waiting (:status row))) {:hold :open-dialog}
       (= :write kind) {:hold :write-in-flight :tool (:tool tool)}
       (true? mode) {:interrupt? true :tool tool}
       (not goal-at-start?) {:hold :no-goal}

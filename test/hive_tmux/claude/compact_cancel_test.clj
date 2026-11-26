@@ -199,7 +199,9 @@
     (is (some? (await-job first-id #(seq (:steps %)))))
     (binding [host/*host* host]
       (loop [blocker first-id
-             [[verb extra] & more] [["compact" {:pane "%9"}] ["say" {:pane "%9" :text "new"}] ["goal" {:pane "%9" :goal "g"}]]]
+             ;; No goal here: a /goal needs no rest and types into the busy
+             ;; pane at once (card 70541f83), so it never waits to be cancelled.
+             [[verb extra] & more] [["compact" {:pane "%9"}] ["say" {:pane "%9" :text "new"}] ["say" {:pane "%9" :text "newer"}]]]
         (let [r (registry/dispatch (merge {:command verb :supersede "true"} extra))
               started (or (first (get-in r [:ok :started])) (:ok r))]
           (testing verb

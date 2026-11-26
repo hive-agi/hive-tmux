@@ -24,13 +24,23 @@
 
         ;; hive-events — event system for pane lifecycle
         io.github.hive-agi/hive-events
-        {:mvn/version "0.6.1"}
+        {:mvn/version "0.6.2"}
+
+        ;; hive-system: STD-04 Unix-socket adapter (T2 path, 0700/0600,
+        ;; connect-probe before unlink) for the observe listener. Only
+        ;; network.path and network.unix are used; they need neither the
+        ;; journal store nor the crypto adapters, so those are excluded.
+        io.github.hive-agi/hive-system
+        {:mvn/version "0.4.4"
+         :exclusions [org.replikativ/datahike
+                      caesium/caesium
+                      com.google.crypto.tink/tink]}
         io.github.hive-agi/hive-vessel {:mvn/version "0.2.3"}}
  :aliases
  {
   ;; :build — tools.build entrypoint (clojure -T:build <task>). Canonical hive
   ;; build: jar / jar-aot / install / bump / verify-license / deploy.
-  :build {:deps {io.github.hive-agi/hive-build {:mvn/version "0.3.1"}}
+  :build {:deps {io.github.hive-agi/hive-build {:mvn/version "0.3.3"}}
           :ns-default hive-build.api}
   :test {:extra-paths ["test"]
          :extra-deps {lambdaisland/kaocha {:mvn/version "1.91.1392"}

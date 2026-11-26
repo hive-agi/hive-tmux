@@ -179,7 +179,14 @@
              :vim-mode (:vim-mode facts)
              :input (:input facts)
              :suggestion (:suggestion facts)
+             :dialog (:dialog facts)
              :tty (not-empty (:tty pane))}
+      ;; The /goal Stop-hook loop (card 20261122170735-7c6f5ad3). Only set
+      ;; when the screen shows it; :goal is the goal TEXT (`panes`
+      ;; :include-goal?), so the footer's goal state is :goal-status.
+      (:goal-status facts) (assoc :goal-status (:goal-status facts))
+      (:stop-hook-running? facts) (assoc :stop-hook-running? true)
+      (:goal-continuing? facts) (assoc :goal-continuing? true)
       ambiguous? (assoc :ambiguous? true)
       (nil? session) (assoc :unjoined? true))))
 
@@ -251,7 +258,7 @@
                (codex-row p)
                (let [row (assoc (pane-row p (screen/read-screen (or (capture h (:pane p) lines) [])) sessions)
                                 :provider :claude
-                                :capabilities #{:read-screen :say :compact :goal})]
+                                :capabilities #{:read-screen :say :compact :goal :answer})]
                  (if (and include-goal? (:goal-active? row) (:session-id row))
                    (assoc row :goal (goal-text (or ((:transcript h) (:cwd row) (:session-id row)) [])))
                    row))))

@@ -100,7 +100,9 @@
       (str/starts-with? line "/compact") (compact-now (assoc s :typed nil))
       :else (-> s (update :sent conj line)
                 (assoc :busy? true :tool nil :busy-reads 2)
-                (cond-> (str/starts-with? line "/goal ") (assoc :goal? true))))))
+                (cond-> (str/starts-with? line "/goal ")
+                  ;; Claude Code writes the /goal entry to the transcript.
+                  (-> (assoc :goal? true) (update :transcript (fnil conj []) (goal-line (subs line 6)))))))))
 
 (defn- key! [s k]
   (case k

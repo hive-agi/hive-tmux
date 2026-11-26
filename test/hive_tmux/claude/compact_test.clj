@@ -44,7 +44,13 @@
                   (swap! st (fn [s]
                               (-> (cond-> (-> s (update :sent conj line) (assoc :busy-polls 2 :typed ""))
                                     (str/starts-with? line "/compact") (assoc :tokens 30000 :goal? false)
-                                    (str/starts-with? line "/goal ") (assoc :goal? true)
+                                    (str/starts-with? line "/goal ")
+                                    (-> (assoc :goal? true)
+                                        (update :transcript (fnil conj [])
+                                                (json/write-str {:type "user"
+                                                                 :message {:role "user"
+                                                                           :content (str "<command-name>/goal</command-name>\n<command-args>"
+                                                                                         (subs line 6) "</command-args>")}})))
                                     (= line "hive workflow catchup /caveman") (update :tokens + 20000))
                                   (after-submit line)))))
         human-turn (fn [s]
@@ -134,8 +140,9 @@
                                                        (cond-> s (str/starts-with? line "/goal ")
                                                          (assoc :busy-polls 0 :goal? false)))})
         job (compact/start! "%9" (assoc fast :host host :kind :goal :goal "Take the next card."))]
-    (is (= :done (:status job)))
-    (is (false? (:started? job)) "the pane never showed it working nor the goal active")))
+    ;; Card 70541f83: a /goal is done only on its own footer, never on a
+    ;; delivery the pane did not acknowledge.
+    (is (= [:failed :goal-unconfirmed] [(:status job) (:reason job)]) "the footer never showed the goal")))
 
 (deftest under-threshold-is-skipped-unless-forced
   (let [{:keys [state host]} (scripted-host {:tokens 100000 :goal? false})]
@@ -224,7 +231,7 @@
     (swap! state assoc :human "hive workflow catchup /caveman")
     (let [job (compact/start! "%9" (assoc fast :host host))]
       (is (= :skipped (:status job)))
-      (is (= :pending-human-input (:reason job)))
+      (is (= :human-typing (:reason job)))
       (is (= "hive workflow catchup /caveman" (get-in job [:error :input])))
       (is (empty? (:sent @state)) "not one key was sent")
       (is (not-any? #(= "send-keys" (first %)) (:argv @state))))))
@@ -260,7 +267,7 @@
   (let [{:keys [state host]} (scripted-host {:tokens 100000 :goal? false})]
     (swap! state assoc :human "half a sentence")
     (let [job (compact/start! "%9" (assoc fast :host host :kind :say :text "hello"))]
-      (is (= [:skipped :pending-human-input] [(:status job) (:reason job)]))
+      (is (= [:skipped :human-typing] [(:status job) (:reason job)]))
       (is (empty? (:sent @state))))))
 
 (deftest goal-arms-a-goal-without-compacting
@@ -298,7 +305,7 @@
     (let [{:keys [state host]} (scripted-host {:tokens 100000 :goal? false})]
       (swap! state assoc :human "half" :ghost " a sentence")
       (let [job (compact/start! "%9" (assoc fast :host host :kind :say :text "hello"))]
-        (is (= [:skipped :pending-human-input] [(:status job) (:reason job)]))
+        (is (= [:skipped :human-typing] [(:status job) (:reason job)]))
         (is (= "half a sentence" (get-in job [:error :input])) "dim beside typed text is input too")
         (is (empty? (:sent @state))))))
   (testing "voice-dictation interim text (all dim) stops it while dictation shows (review F1)"
@@ -306,7 +313,7 @@
       (swap! state assoc :ghost "please stop the deploy" :voice true)
       (doseq [opts [{:kind :say :text "hello"} {}]]
         (let [job (compact/start! "%9" (merge fast {:host host} opts))]
-          (is (= [:skipped :pending-human-input] [(:status job) (:reason job)]) (pr-str opts))
+          (is (= [:skipped :human-typing] [(:status job) (:reason job)]) (pr-str opts))
           (is (= "please stop the deploy" (get-in job [:error :input])))))
       (is (empty? (:sent @state))))))
 
