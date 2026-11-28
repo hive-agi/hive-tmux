@@ -27,7 +27,8 @@
    The first tick only seeds: a pane already idle when the watch starts is not
    news. Every shout is addressed to :parent, the supervisor's agent id, which
    is who `ss wait` hears by default."
-  (:require [clojure.string :as str]
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]
             [hive-dsl.result :refer [guard]]
             [hive-tmux.claude.compact :as compact]
             [hive-tmux.claude.host :as host]
@@ -166,6 +167,47 @@
 
 ;;; Boundary
 
+;;; Auto-arm: the options survive a process restart
+
+(def ^:private persisted-keys
+  "The :opts keys that describe WHAT to watch. Ports and seams never persist:
+   they are resolved fresh, and a stored fn is not readable anyway."
+  [:parent :threshold :interval-ms :exclude :auto-compact?
+   :idle-ms :recheck-ms :idle-capacity? :evidence-interval-ms])
+
+(defn options-path
+  "Where the watcher's options are persisted:
+   $XDG_STATE_HOME/hive-tmux/watch.edn, else ~/.local/state/hive-tmux/watch.edn."
+  ([] (options-path {}))
+  ([{:keys [xdg-state home] :or {home (System/getProperty "user.home")}}]
+   (str (if (str/blank? xdg-state) (str home "/.local/state") xdg-state)
+        "/hive-tmux/watch.edn")))
+
+(defn arm-options
+  "The opts worth persisting, as data. Pure."
+  [opts]
+  (select-keys opts persisted-keys))
+
+(defn persist!
+  "Write OPTS to PATH so the next process can re-arm. Soft-fails: a watcher
+   that cannot record itself still watches. Returns the path, or nil."
+  ([opts] (persist! opts (options-path)))
+  ([opts path]
+   (guard Throwable nil
+     (do (io/make-parents (io/file path))
+         (spit path (pr-str (arm-options opts)))
+         path))))
+
+(defn read-options
+  "The persisted opts at PATH, or nil when absent or unreadable."
+  [path]
+  (when-not (str/blank? (str path))
+    (guard Throwable nil
+      (let [f (io/file path)]
+        (when (.exists f)
+          (let [m (read-string (slurp f))]
+            (when (map? m) m)))))))
+
 (def shout-sym 'hive-mcp.hivemind.messaging/shout!)
 
 (defonce ^:private watcher (atom nil))
@@ -298,6 +340,9 @@
   (when-let [w @watcher]
     (swap! w assoc :running? false)
     (reset! watcher nil)
+    ;; A deliberate stop disarms persistence too, so the next boot does not
+    ;; resurrect a watcher the operator turned off.
+    (guard Throwable nil (io/delete-file (io/file (options-path)) true))
     (let [{:keys [opts]} @w]
       (when (:auto-compact? opts)
         (let [{:keys [read write!]} (:lease opts)]
@@ -337,6 +382,9 @@
                        :states {} :started-at (System/currentTimeMillis) :ticks 0 :fired {}
                        :silenced [] :auto-compacts []})]
           (when auto-compact? ((:write! lease) {:owner parent :renewed-ms now}))
+          ;; Persist WHAT to watch BEFORE the thread starts, so a process that
+          ;; dies mid-watch still leaves the next boot something to re-arm from.
+          (persist! opts (:options-path opts))
           (reset! watcher w)
           (future
             (while (:running? @w)
@@ -352,6 +400,22 @@
     (-> @w (dissoc :host :ic-states :evidence-cache) (update :states count)
         (update :opts #(apply dissoc % port-keys)) (assoc :running? true))
     {:running? false}))
+
+(defn arm!
+  "Re-arm the watcher at PATH when it is not already running: the answer a
+   fresh process gives on boot, so a restart does not silently disarm the
+   supervision the operator left running. A missing or unreadable file is a
+   no-op (:reason :no-options: nobody ever armed one)."
+  ([] (arm! (options-path)))
+  ([path]
+   (if (running?)
+     {:armed? false :reason :already-running}
+     (if-let [opts (read-options path)]
+       (let [r (start! (merge opts {:host (host/host)}))]
+         (if (:running? r)
+           {:armed? true :path path :parent (:parent opts)}
+           {:armed? false :reason (:refused r)}))
+       {:armed? false :reason :no-options :path path}))))
 
 (defn job-ended!
   "Shout a finished compact | say | goal JOB to the running watcher's parent.
